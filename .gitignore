@@ -1,0 +1,17 @@
+# Môi trường ảo
+.venv/
+__pycache__/
+.pytest_cache/
+
+# Dữ liệu nặng (Tránh đẩy lên Github làm chậm repo)
+data/
+*.csv
+
+# Kết quả huấn luyện
+outputs/
+*.pth
+*.png
+
+# Hệ thống
+.DS_Store
+.vscode/
