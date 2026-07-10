@@ -18,19 +18,13 @@ Architecture (as specified):
         -> 4 x FC(145) hidden layers
         -> Output FC(1)  (predicted Temperature)
 
-SKELETON ONLY -- layer wiring/forward pass intentionally left unimplemented.
-Pre-layer output width and activation placement beyond what's specified above
-are NOT finalized here; Kieu should confirm exact dims with the leader before
-implementing so the architecture matches the paper.
-
-IMPORTANT for src/losses.py integration: AdaptivePINNLoss's Cho2022 Adaptive
-Normalization scheme computes gradients w.r.t. the model's SHARED last-layer
-weights only (the concat -> 4x145 FC -> output stack), NOT the input-specific
-Sin/Exp pre-layer branches. That means __init__ needs to keep the shared FC
-stack in its own submodule (e.g. self.shared_fc = nn.Sequential(...)) so
-shared_parameters() below can return exactly those parameters, separate from
-the branch pre-layers.
+Implemented by Kieu: pre-layer output width is 16 per branch (32 after
+concat) -- not specified by the paper beyond the activation assignment, so
+treated as an ordinary architecture hyperparameter. shared_parameters()
+(required by src/losses.py's AdaptivePINNLoss) returns fc_stack + output_layer
+parameters, excluding the Sin/Exp pre-layer branches.
 """
+from itertools import chain
 from typing import Iterator
 
 import torch
@@ -95,27 +89,39 @@ class BatteryPINN_Cho2022(nn.Module):
         self.n_hidden_layers = n_hidden_layers
         self.output_dim = output_dim
 
-        # TODO(Kieu): declare pre-layer submodules here, e.g.
-        #   self.current_branch = nn.Sequential(nn.Linear(1, ...), SinActivation())
-        #   self.other_branch   = nn.Sequential(nn.Linear(input_dim - 1, ...), ExpActivation())
-        # then the concat -> 4x145 FC stack -> output layer. Keep the shared
-        # FC stack in its own submodule (e.g. self.shared_fc) -- see
-        # shared_parameters() below and the module docstring for why.
+        self.current_out_dim = 16
+        self.other_out_dim = 16
+
+        # Current branch (1 feature)
+        self.current_branch = nn.Sequential(nn.Linear(1, self.current_out_dim), SinActivation())
+        # others branch [Time, Voltage, OCV_Estimated] (input_dim - 1 = 3 features)
+        self.other_branch = nn.Sequential(nn.Linear(self.input_dim - 1, self.other_out_dim), ExpActivation())
+
+        concat_dim = self.current_out_dim + self.other_out_dim
+
+        layers = []
+        layers.append(nn.Linear(concat_dim, self.hidden_dim))
+        layers.append(nn.Tanh())  # use Tanh as the main activation function since it is smooth on R
+
+        for _ in range(self.n_hidden_layers - 1):
+            layers.append(nn.Linear(self.hidden_dim, self.hidden_dim))
+            layers.append(nn.Tanh())
+
+        self.fc_stack = nn.Sequential(*layers)
+
+        # output layer - predict Temperature
+        self.output_layer = nn.Linear(self.hidden_dim, self.output_dim)
 
     def shared_parameters(self) -> Iterator[nn.Parameter]:
         """Parameters of the SHARED last-layer stack only (concat -> 4x145 FC
         -> output), excluding the input-specific Sin/Exp pre-layer branches.
 
-        Used by src.losses.AdaptivePINNLoss.update_weights() for Cho 2022's
+        Required by src.losses.AdaptivePINNLoss.update_weights() for Cho 2022's
         Adaptive Normalization gradient-balancing scheme, which is defined
-        w.r.t. these shared weights specifically.
-
-        Returns
-        -------
-        Iterator[nn.Parameter]
-            e.g. `self.shared_fc.parameters()` once that submodule exists.
+        w.r.t. these shared weights specifically -- see that module's
+        docstring for why.
         """
-        raise NotImplementedError("Kieu: return self.shared_fc.parameters() (or equivalent) once declared in __init__")
+        return chain(self.fc_stack.parameters(), self.output_layer.parameters())
 
     def forward(self, x: Tensor) -> Tensor:
         """
