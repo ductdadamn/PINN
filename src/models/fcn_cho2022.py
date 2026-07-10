@@ -34,17 +34,14 @@ OUTPUT_DIM = 1  # Temperature
 
 
 class SinActivation(nn.Module):
-    """sin(x) activation, used on the Current pre-layer branch."""
-
     def forward(self, x: Tensor) -> Tensor:
-        raise NotImplementedError("Kieu: implement sin activation")
+        return torch.sin(x)
 
 
 class ExpActivation(nn.Module):
-    """exp(x) activation, used on the [Time, Voltage, OCV_Estimated] pre-layer branch."""
-
     def forward(self, x: Tensor) -> Tensor:
-        raise NotImplementedError("Kieu: implement exp activation (watch for overflow)")
+        # use clamp to avoid overflow
+        return torch.exp(torch.clamp(x, max=88.0))
 
 
 class BatteryPINN_Cho2022(nn.Module):
@@ -84,10 +81,34 @@ class BatteryPINN_Cho2022(nn.Module):
         self.n_hidden_layers = n_hidden_layers
         self.output_dim = output_dim
 
-        # TODO(Kieu): declare pre-layer submodules here, e.g.
+        # TODO AOI(Kieu): declare pre-layer submodules here, e.g.
         #   self.current_branch = nn.Sequential(nn.Linear(1, ...), SinActivation())
         #   self.other_branch   = nn.Sequential(nn.Linear(input_dim - 1, ...), ExpActivation())
         # then the concat -> 4x145 FC stack -> output layer.
+        
+        # jjk
+        self.current_out_dim = 16
+        self.other_out_dim = 16
+        
+        # Current branch (1 feature)
+        self.current_branch = nn.Sequential(nn.Linear(1, self.current_out_dim), SinActivation())
+        # others branch [Time, Voltage, OCV_Estimated] (input_dim - 1 = 3 features)
+        self.other_branch = nn.Sequential(nn.Linear(self.input_dim - 1, self.other_out_dim), ExpActivation())
+        
+        concat_dim = self.current_out_dim + self.other_out_dim
+        
+        layers = []
+        layers.append(nn.Linear(concat_dim, self.hidden_dim))
+        layers.append(nn.Tanh()) # use Tanh as the main activation function since it is smooth on R
+        
+        for _ in range(self.n_hidden_layers - 1):
+            layers.append(nn.Linear(self.hidden_dim, self.hidden_dim))
+            layers.append(nn.Tanh())
+            
+        self.fc_stack = nn.Sequential(*layers)
+        
+        # output layer - predict Temperature
+        self.output_layer = nn.Linear(self.hidden_dim, self.output_dim)
 
     def forward(self, x: Tensor) -> Tensor:
         """
@@ -101,7 +122,17 @@ class BatteryPINN_Cho2022(nn.Module):
         Tensor, shape (batch, output_dim)
             Predicted temperature.
         """
-        raise NotImplementedError(
-            "Kieu: split x into Current vs [Time, Voltage, OCV_Estimated], "
-            "run pre-layers, concat, run 4x145 FC stack, output layer"
-        )
+        
+        # the feature Current (index 1) 
+        current = x[:, [1]]  # Shape: (batch, 1)
+        # others features
+        other_features = x[:, [0, 2, 3]]  # Shape: (batch, 3)
+        
+        # pass through pre-layer, concatenate, pass through FCN and return output 
+        out_current = self.current_branch(current)
+        out_other = self.other_branch(other_features)
+        out_concat = torch.cat([out_current, out_other], dim=1)
+        out_fc = self.fc_stack(out_concat)
+        output = self.output_layer(out_fc)
+        return output
+    
