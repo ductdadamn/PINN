@@ -22,9 +22,10 @@ def main():
     print(f"Test  (FUDS) samples: {len(test_dataset)}")
 
     loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-    x_batch, y_batch = next(iter(loader))
+    x_batch, y_batch, is_initial_batch = next(iter(loader))
     print(f"Batch features shape: {tuple(x_batch.shape)}  (expected: [batch, 4] for sequence_length=1)")
     print(f"Batch target shape:   {tuple(y_batch.shape)}  (expected: [batch, 1])")
+    print(f"Batch is_initial_step shape: {tuple(is_initial_batch.shape)}  (expected: [batch]; sum is usually 0, since each trajectory has only 1 such row)")
 
     df_fuds = meta["df_fuds"]
     fig, ax1 = plt.subplots(figsize=(12, 6))
