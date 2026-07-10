@@ -59,10 +59,18 @@ def train(
         Yields (x, y) batches from the DST BatteryDataset:
         x shape (batch, 4), y shape (batch, 1).
     loss_fn : AdaptivePINNLoss
-        Combines data + physics loss; see src/losses.py for its forward()
-        contract (returns (total_loss, log_dict)).
+        Combines data + physics loss (Lumped Capacitance Model residual).
+        IMPORTANT: loss_fn.forward(x, y) now runs `model(x)` internally
+        (needed so it can autograd dT/dt w.r.t. the raw input) -- do NOT
+        call model(x) yourself and pass y_pred in; pass the raw batch x
+        straight to loss_fn. See src/losses.py's forward() docstring.
     optimizer : torch.optim.Optimizer
-        e.g. torch.optim.Adam(model.parameters(), lr=...).
+        Must include BOTH the model's and the loss's parameters, since
+        AdaptivePINNLoss owns trainable lambda1/lambda2:
+            optimizer = torch.optim.Adam(
+                list(model.parameters()) + list(loss_fn.parameters()), lr=...
+            )
+        (see main() below, already wired this way)
     epochs : int
         Number of training epochs.
     device : str
@@ -79,13 +87,16 @@ def train(
     2. for each epoch: for each (x, y) batch:
          - move x, y to device
          - optimizer.zero_grad()
-         - y_pred = model(x)
-         - loss, log_dict = loss_fn(y_pred, y, ...)  # physics_inputs TBD once
-           compute_physics_loss is implemented
+         - loss, log_dict = loss_fn(x, y)
          - loss.backward()
          - optimizer.step()
        accumulate/log metrics (e.g. print epoch loss, alpha, beta from log_dict)
     3. return model
+
+    Note: loss_fn.update_weights() (the alpha/beta EMA rule) is still a
+    NotImplementedError stub in src/losses.py as of this skeleton -- this
+    loop will raise until the leader fills that in. Everything else
+    (compute_data_loss, compute_physics_loss) is implemented and testable.
     """
     raise NotImplementedError("Cam: implement the training loop")
 
@@ -104,8 +115,14 @@ def main() -> None:
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
 
     model = BatteryPINN_Cho2022().to(args.device)
-    loss_fn = AdaptivePINNLoss(model)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    loss_fn = AdaptivePINNLoss(
+        model,
+        feature_scaler=train_dataset.feature_scaler,
+        target_scaler=train_dataset.target_scaler,
+    ).to(args.device)
+    optimizer = torch.optim.Adam(
+        list(model.parameters()) + list(loss_fn.parameters()), lr=args.lr
+    )
 
     model = train(model, train_loader, loss_fn, optimizer, args.epochs, args.device)
     save_checkpoint(model, args.checkpoint_path)

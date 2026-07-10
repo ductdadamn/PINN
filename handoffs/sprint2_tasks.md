@@ -22,21 +22,27 @@ This is what lets all 4 pieces plug together without renegotiating interfaces mi
 - **Features** (from `src.data_loader.BatteryDataset`): `Tensor` shape `(batch, 4)`, order `[Time, Current, Voltage, OCV_Estimated]`, Min-Max scaled to `[0,1]`.
 - **Target**: `Tensor` shape `(batch, 1)`, Temperature, Min-Max scaled to `[0,1]` (scaler fit on DST train set only — see `src/data_loader.py`'s handoff for why).
 - **`BatteryPINN_Cho2022.forward(x)`**: input `(batch, 4)` → output `(batch, 1)`. Same shape as the target tensor, so it can be compared directly.
-- **`AdaptivePINNLoss.forward(y_pred, y_true, *physics_inputs)`**: returns `(total_loss: Tensor, log_dict: Dict[str, float])`. `log_dict` includes at least `data_loss`, `physics_loss`, `alpha`, `beta` — `train_fcn.py` should log these per epoch.
+- **`AdaptivePINNLoss.forward(x, y_true)`** *(updated from the original skeleton — see below)*: returns `(total_loss: Tensor, log_dict: Dict[str, float])`. `log_dict` includes `data_loss`, `physics_loss`, `alpha`, `beta`, `lambda1`, `lambda2` — `train_fcn.py` should log these per epoch.
+
+> **Update since PR #2 merged:** the physics equation is now confirmed (Lumped Capacitance Model, see below), which changed `AdaptivePINNLoss`'s interface from the original skeleton:
+> - Constructor now requires `feature_scaler` and `target_scaler` (pass `train_dataset.feature_scaler` / `.target_scaler`), since the physics residual needs to unscale back to real units.
+> - `forward(x, y_true)` now takes the **raw scaled input batch `x`**, not a precomputed `y_pred` — it runs `model(x)` internally so it can autograd `dT/dt` w.r.t. the input. **Do not call `model(x)` yourself and pass the output in.**
+> - The optimizer must include `loss_fn.parameters()` too (owns trainable `lambda1`, `lambda2`): `torch.optim.Adam(list(model.parameters()) + list(loss_fn.parameters()), lr=...)`.
+> - `scripts/train_fcn.py`'s `main()` and docstrings are already updated to match — Cam just needs to fill in the loop body per the updated TODO.
 - **Checkpoint**: `scripts/train_fcn.py` saves to `outputs/checkpoints/fcn_cho2022.pth` (via `model.state_dict()`); `scripts/evaluate.py` loads from the same default path. Both are `outputs/` (gitignored) — checkpoints are local artifacts, not committed.
 
 ## Per-file detail
 
 ### `src/losses.py` — Leader
 
-`AdaptivePINNLoss(nn.Module)`:
-- `compute_data_loss(y_pred, y_true) -> Tensor` — differentiable scalar.
-- `compute_physics_loss(*physics_inputs) -> Tensor` — differentiable scalar; exact signature still open pending the PDE residual spec from the Strategic Planner.
-- `_max_abs_grad(loss, params) -> Tensor` — `max(|∇θ loss|)` over given params.
-- `update_weights(data_loss, physics_loss) -> (alpha, beta)` — EMA-based gradient-magnitude balancing, decay = `ema_decay`.
-- `forward(y_pred, y_true, *physics_inputs) -> (total_loss, log_dict)`.
+`AdaptivePINNLoss(nn.Module)` — **implemented**, except `update_weights`:
+- `compute_data_loss(y_pred, y_true) -> Tensor` — MSE, done.
+- `compute_physics_loss(x, T_pred_scaled) -> Tensor` — Lumped Capacitance Model residual `f = dT/dt + lambda1*(V-V_ocv)*I + lambda2*(T_amb-T)`, `Loss = mean(f**2)`, done. Unscales all quantities back to real units before evaluating (see module docstring for why). `lambda1`/`lambda2` are trainable `nn.Parameter`s.
+- `_max_abs_grad(loss, params) -> Tensor` — `max(|∇θ loss|)` over given params, done.
+- `update_weights(data_loss, physics_loss) -> (alpha, beta)` — **still `NotImplementedError`**. EMA-based gradient-magnitude balancing; exact formula not yet confirmed (which loss's max vs mean, fixed vs adaptive alpha). `forward()` will raise until this is filled in — everything else is independently testable in the meantime.
+- `forward(x, y_true) -> (total_loss, log_dict)` — runs `model(x)` internally (see contract note above), done except for the `update_weights` call inside it.
 
-**Not implementing the exact weighting formula yet** — per project rule, core loss math needs explicit instruction before being written; will follow in a dedicated task once the PDE term is specified.
+Validated with a dummy stand-in model (since `BatteryPINN_Cho2022.forward` isn't implemented yet): gradients correctly flow into both `lambda1`/`lambda2` and the model's parameters through the physics residual term.
 
 ### `src/models/fcn_cho2022.py` — Kieu
 
