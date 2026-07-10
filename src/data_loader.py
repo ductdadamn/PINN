@@ -10,12 +10,14 @@ above is applied to the raw Current(A) column unchanged -- no sign flip.
 """
 import glob
 import os
+import random
+from typing import Iterable, Iterator, List
 
 import numpy as np
 import pandas as pd
 import torch
 from sklearn.preprocessing import MinMaxScaler
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 
 TIME_COL = "Test_Time(s)"
 CURRENT_COL = "Current(A)"
@@ -282,6 +284,71 @@ class BatteryDataset(Dataset):
             y = self.target[idx + self.sequence_length - 1]  # target at window end
         is_initial = self.is_initial_step[idx]
         return torch.from_numpy(x), torch.from_numpy(y), torch.tensor(is_initial, dtype=torch.float32)
+
+
+class AnchorInclusiveBatchSampler(Sampler[List[int]]):
+    """BatchSampler that guarantees every yielded batch includes all of
+    `anchor_indices` (for BatteryDataset, always [0] -- the t_start row),
+    alongside a shuffled selection of the remaining indices.
+
+    WHY THIS EXISTS: AdaptivePINNLoss's Loss_initial (src/losses.py) is only
+    nonzero -- and only has nonzero gradient -- on samples where
+    is_initial_step==1. Each BatteryDataset trajectory has exactly ONE such
+    row (index 0). With plain `shuffle=True` and batch_size << dataset size,
+    that row lands in roughly 1-in-(dataset_len/batch_size) batches, so on
+    every other batch mean(|grad Loss_initial|) is EXACTLY zero, which blew
+    up update_weights()'s beta_hat = max(|grad L_data|) / mean(|grad
+    L_initial|) into the billions within a single trial epoch (confirmed
+    empirically -- see handoffs/sprint2_tasks.md). This sampler fixes that at
+    the data-loading level: the anchor row is always present, so that
+    denominator is never exactly zero.
+
+    Parameters
+    ----------
+    dataset_len : int
+        Length of the dataset being sampled (e.g. len(train_dataset)).
+    batch_size : int
+        TOTAL batch size, including the anchor row(s) -- e.g. batch_size=32
+        with 1 anchor index yields batches of 1 anchor + 31 other samples.
+    anchor_indices : Iterable[int]
+        Indices that must appear in every batch. Default (0,) matches
+        BatteryDataset's single t_start row per trajectory.
+    shuffle : bool
+        Whether to shuffle the non-anchor indices each epoch (and each
+        batch's internal order).
+    """
+
+    def __init__(
+        self,
+        dataset_len: int,
+        batch_size: int,
+        anchor_indices: Iterable[int] = (0,),
+        shuffle: bool = True,
+    ) -> None:
+        self.dataset_len = dataset_len
+        self.batch_size = batch_size
+        self.anchor_indices = list(anchor_indices)
+        self.shuffle = shuffle
+        if batch_size <= len(self.anchor_indices):
+            raise ValueError("batch_size must be greater than the number of anchor indices")
+
+    def __iter__(self) -> Iterator[List[int]]:
+        anchor_set = set(self.anchor_indices)
+        other_indices = [i for i in range(self.dataset_len) if i not in anchor_set]
+        if self.shuffle:
+            random.shuffle(other_indices)
+
+        per_batch_other = self.batch_size - len(self.anchor_indices)
+        for start in range(0, len(other_indices), per_batch_other):
+            batch = list(self.anchor_indices) + other_indices[start: start + per_batch_other]
+            if self.shuffle:
+                random.shuffle(batch)
+            yield batch
+
+    def __len__(self) -> int:
+        n_other = self.dataset_len - len(self.anchor_indices)
+        per_batch_other = self.batch_size - len(self.anchor_indices)
+        return (n_other + per_batch_other - 1) // per_batch_other
 
 
 # ---------------------------------------------------------------------------

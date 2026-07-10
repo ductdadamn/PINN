@@ -27,6 +27,12 @@ This is what lets all 4 pieces plug together without renegotiating interfaces mi
 - **`BatteryPINN_Cho2022.shared_parameters()`** *(new requirement)*: returns only the parameters of the shared 4x145 FC + output stack (not the Sin/Exp pre-layer branches). Required by `AdaptivePINNLoss.update_weights()` — see below.
 - **`AdaptivePINNLoss.forward(x, y_true, is_initial_step)`** *(updated from the original skeleton — see below)*: returns `(total_loss: Tensor, log_dict: Dict[str, float])`. `log_dict` includes `data_loss`, `physics_loss`, `initial_loss`, `alpha`, `beta`, `lambda1`, `lambda2` — `train_fcn.py` should log these per epoch.
 - **Optimizer**: `torch.optim.Adam(loss_fn.parameters(), lr=...)` — NOT `model.parameters() + loss_fn.parameters()`. `model` is a registered submodule of `loss_fn`, so `loss_fn.parameters()` already includes every model parameter plus `lambda1`/`lambda2`; concatenating both double-counts them (a real bug caught during a trial run, now fixed in `train_fcn.py`).
+- **`AnchorInclusiveBatchSampler`** (`src/data_loader.py`): use this instead of `DataLoader(..., shuffle=True)` for training. `Loss_initial` only has signal on the one `t_start` row per trajectory; plain shuffling meant most batches had *zero* gradient there, which sent `beta` in `update_weights()` to the trillions (divide by an exact-zero denominator, confirmed in a trial run). This sampler guarantees the anchor row is in every batch:
+  ```python
+  train_sampler = AnchorInclusiveBatchSampler(len(train_dataset), batch_size=args.batch_size, anchor_indices=(0,), shuffle=True)
+  train_loader = DataLoader(train_dataset, batch_sampler=train_sampler)
+  ```
+  (already wired into `train_fcn.py`'s `main()`). Not needed for `evaluate.py` (FUDS) — plain `DataLoader(..., shuffle=False)` is fine there since inference doesn't call `update_weights`.
 
 > **Update since PR #2 merged:** the physics equation and the alpha/beta weighting formula are now both confirmed, which changed `AdaptivePINNLoss`'s interface from the original skeleton:
 > - Constructor now requires `feature_scaler` and `target_scaler` (pass `train_dataset.feature_scaler` / `.target_scaler`), since the physics residual needs to unscale back to real units.

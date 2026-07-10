@@ -23,7 +23,7 @@ from torch.utils.data import DataLoader
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.data_loader import build_datasets  # noqa: E402
+from src.data_loader import AnchorInclusiveBatchSampler, build_datasets  # noqa: E402
 from src.losses import AdaptivePINNLoss  # noqa: E402
 from src.models.fcn_cho2022 import BatteryPINN_Cho2022  # noqa: E402
 
@@ -59,6 +59,10 @@ def train(
         Yields (x, y, is_initial_step) 3-tuples from the DST BatteryDataset
         (NOT (x, y) -- see src/data_loader.py's BatteryDataset docstring):
         x shape (batch, 4), y shape (batch, 1), is_initial_step shape (batch,).
+        Built with batch_sampler=AnchorInclusiveBatchSampler (see main()),
+        NOT plain shuffle=True -- guarantees the t_start anchor row is in
+        every batch, which Loss_initial's gradient-ratio weighting needs
+        (see AnchorInclusiveBatchSampler's docstring for why).
     loss_fn : AdaptivePINNLoss
         Combines data + physics (PDE) + initial-condition loss. IMPORTANT:
         loss_fn.forward(x, y, is_initial_step) runs `model(x)` internally
@@ -116,7 +120,10 @@ def main() -> None:
     train_dataset, _test_dataset, _meta = build_datasets(
         raw_dir="data/raw", sequence_length=args.sequence_length
     )
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+    train_sampler = AnchorInclusiveBatchSampler(
+        len(train_dataset), batch_size=args.batch_size, anchor_indices=(0,), shuffle=True
+    )
+    train_loader = DataLoader(train_dataset, batch_sampler=train_sampler)
 
     model = BatteryPINN_Cho2022().to(args.device)
     loss_fn = AdaptivePINNLoss(
