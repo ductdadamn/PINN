@@ -9,7 +9,7 @@ plot. This is the script that should demonstrate the FCN's failure to
 generalize to the unseen dynamic-load profile (per Sprint 2's goal).
 
 Run:
-    .venv/bin/python scripts/evaluate.py --raw-dir PINN_dataset --checkpoint-path outputs/checkpoints/fcn_cho2022.pth
+    .venv/bin/python scripts/evaluate.py --checkpoint-path outputs/checkpoints/fcn_cho2022.pth
 """
 import argparse
 import os
@@ -66,9 +66,12 @@ def run_inference(model: BatteryPINN_Cho2022, test_loader: DataLoader, device: s
     model : BatteryPINN_Cho2022
         Trained model in eval() mode.
     test_loader : DataLoader
-        Yields (x, y) batches from the FUDS BatteryDataset:
-        x shape (batch, 4), y shape (batch, 1). Note: y is Min-Max SCALED
-        (same scaler fit on DST train set, see src/data_loader.build_datasets) --
+        Yields (x, y, is_initial_step) 3-tuples from the FUDS BatteryDataset
+        (NOT (x, y) -- see src/data_loader.py's BatteryDataset docstring):
+        x shape (batch, 4), y shape (batch, 1). is_initial_step isn't needed
+        for plain inference (that's a training-time loss term) -- just
+        unpacked and discarded. Note: y is Min-Max SCALED (same scaler fit
+        on DST train set, see src/data_loader.build_datasets) --
         inverse-transform before computing RMSE/MAE in real-world units (deg C).
     device : str
         "cuda" or "cpu".
@@ -91,7 +94,7 @@ def run_inference(model: BatteryPINN_Cho2022, test_loader: DataLoader, device: s
     y_pred_scaled = []
 
     with torch.no_grad():
-        for x, y in test_loader:
+        for x, y, _is_initial_step in test_loader:
             x = x.to(device)
             y_pred = model(x)
             y_true_scaled.append(y.cpu().numpy())
