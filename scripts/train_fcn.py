@@ -3,17 +3,15 @@ Training script for the Cho2022 FCN baseline.
 
 Owner: Cam.
 
+
 Goal: train BatteryPINN_Cho2022 on the DST (train) split, using
 AdaptivePINNLoss, and checkpoint the trained model for scripts/evaluate.py
 to consume.
 
 Run (once implemented):
     .venv/bin/python scripts/train_fcn.py --epochs 100 --batch-size 32 --lr 1e-3
-
-SKELETON ONLY -- the training loop body is intentionally left unimplemented.
-Do not modify src/losses.py's math or src/data_loader.py's pipeline while
-wiring this up; import and use them as-is.
 """
+
 import argparse
 import os
 import sys
@@ -87,31 +85,42 @@ def train(
     -------
     BatteryPINN_Cho2022
         The trained model (same object, mutated in place).
-
-    Expected steps (TODO for Cam)
-    ------------------------------
-    1. model.train()
-    2. for each epoch: for each (x, y, is_initial_step) batch:
-         - move x, y, is_initial_step to device
-         - optimizer.zero_grad()
-         - loss, log_dict = loss_fn(x, y, is_initial_step)
-         - loss.backward()
-         - optimizer.step()
-       accumulate/log metrics (e.g. print epoch loss, alpha, beta from log_dict)
-    3. return model
-
-    Note: src/losses.py's AdaptivePINNLoss is fully implemented now (data,
-    physics, and initial-condition losses, plus the Cho 2022 Adaptive
-    Normalization alpha/beta update) -- this loop is only blocked on
-    BatteryPINN_Cho2022.forward()/shared_parameters() (Kieu's file), not on
-    anything here in src/losses.py.
     """
-    raise NotImplementedError("Cam: implement the training loop")
+    model.train()
+    
+    for epoch in range(epochs):
+        epoch_loss = 0.0
+        last_log_dict = {}
+        
+        for x, y, is_initial_step in train_loader:
+            x = x.to(device)
+            y = y.to(device)
+            is_initial_step = is_initial_step.to(device)
+            
+            optimizer.zero_grad()
+            
+            loss, log_dict = loss_fn(x, y, is_initial_step)
+            
+            loss.backward()
+            optimizer.step()
+            
+            epoch_loss += loss.item()
+            last_log_dict = log_dict
+            
+        avg_loss = epoch_loss / len(train_loader)
+        alpha = last_log_dict.get('alpha', 'N/A')
+        beta = last_log_dict.get('beta', 'N/A')
+        
+        print(f"Epoch {epoch+1}/{epochs} - Loss: {avg_loss:.6f}, Alpha: {alpha}, Beta: {beta}")
+        
+    return model
 
 
 def save_checkpoint(model: BatteryPINN_Cho2022, path: str) -> None:
     """Save model state_dict to `path`, creating parent dirs as needed."""
-    raise NotImplementedError("Cam: implement checkpoint saving (torch.save(model.state_dict(), path))")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    torch.save(model.state_dict(), path)
+    print(f"Checkpoint saved to {path}")
 
 
 def main() -> None:
