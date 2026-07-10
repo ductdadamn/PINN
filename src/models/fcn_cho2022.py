@@ -18,11 +18,15 @@ Architecture (as specified):
         -> 4 x FC(145) hidden layers
         -> Output FC(1)  (predicted Temperature)
 
-SKELETON ONLY -- layer wiring/forward pass intentionally left unimplemented.
-Pre-layer output width and activation placement beyond what's specified above
-are NOT finalized here; Kieu should confirm exact dims with the leader before
-implementing so the architecture matches the paper.
+Implemented by Kieu: pre-layer output width is 16 per branch (32 after
+concat) -- not specified by the paper beyond the activation assignment, so
+treated as an ordinary architecture hyperparameter. shared_parameters()
+(required by src/losses.py's AdaptivePINNLoss) returns fc_stack + output_layer
+parameters, excluding the Sin/Exp pre-layer branches.
 """
+from itertools import chain
+from typing import Iterator
+
 import torch
 import torch.nn as nn
 from torch import Tensor
@@ -34,13 +38,17 @@ OUTPUT_DIM = 1  # Temperature
 
 
 class SinActivation(nn.Module):
+    """sin(x) activation, used on the Current pre-layer branch."""
+
     def forward(self, x: Tensor) -> Tensor:
         return torch.sin(x)
 
 
 class ExpActivation(nn.Module):
+    """exp(x) activation, used on the [Time, Voltage, OCV_Estimated] pre-layer branch."""
+
     def forward(self, x: Tensor) -> Tensor:
-        # use clamp to avoid overflow
+        # clamp to avoid float32 overflow (exp(x) overflows past x~88.7)
         return torch.exp(torch.clamp(x, max=88.0))
 
 
@@ -81,34 +89,39 @@ class BatteryPINN_Cho2022(nn.Module):
         self.n_hidden_layers = n_hidden_layers
         self.output_dim = output_dim
 
-        # TODO AOI(Kieu): declare pre-layer submodules here, e.g.
-        #   self.current_branch = nn.Sequential(nn.Linear(1, ...), SinActivation())
-        #   self.other_branch   = nn.Sequential(nn.Linear(input_dim - 1, ...), ExpActivation())
-        # then the concat -> 4x145 FC stack -> output layer.
-        
-        # jjk
         self.current_out_dim = 16
         self.other_out_dim = 16
-        
+
         # Current branch (1 feature)
         self.current_branch = nn.Sequential(nn.Linear(1, self.current_out_dim), SinActivation())
         # others branch [Time, Voltage, OCV_Estimated] (input_dim - 1 = 3 features)
         self.other_branch = nn.Sequential(nn.Linear(self.input_dim - 1, self.other_out_dim), ExpActivation())
-        
+
         concat_dim = self.current_out_dim + self.other_out_dim
-        
+
         layers = []
         layers.append(nn.Linear(concat_dim, self.hidden_dim))
-        layers.append(nn.Tanh()) # use Tanh as the main activation function since it is smooth on R
-        
+        layers.append(nn.Tanh())  # use Tanh as the main activation function since it is smooth on R
+
         for _ in range(self.n_hidden_layers - 1):
             layers.append(nn.Linear(self.hidden_dim, self.hidden_dim))
             layers.append(nn.Tanh())
-            
+
         self.fc_stack = nn.Sequential(*layers)
-        
+
         # output layer - predict Temperature
         self.output_layer = nn.Linear(self.hidden_dim, self.output_dim)
+
+    def shared_parameters(self) -> Iterator[nn.Parameter]:
+        """Parameters of the SHARED last-layer stack only (concat -> 4x145 FC
+        -> output), excluding the input-specific Sin/Exp pre-layer branches.
+
+        Required by src.losses.AdaptivePINNLoss.update_weights() for Cho 2022's
+        Adaptive Normalization gradient-balancing scheme, which is defined
+        w.r.t. these shared weights specifically -- see that module's
+        docstring for why.
+        """
+        return chain(self.fc_stack.parameters(), self.output_layer.parameters())
 
     def forward(self, x: Tensor) -> Tensor:
         """
@@ -122,17 +135,13 @@ class BatteryPINN_Cho2022(nn.Module):
         Tensor, shape (batch, output_dim)
             Predicted temperature.
         """
-        
-        # the feature Current (index 1) 
+        # Current is index 1; [Time, Voltage, OCV_Estimated] are indices [0, 2, 3]
         current = x[:, [1]]  # Shape: (batch, 1)
-        # others features
         other_features = x[:, [0, 2, 3]]  # Shape: (batch, 3)
-        
-        # pass through pre-layer, concatenate, pass through FCN and return output 
+
         out_current = self.current_branch(current)
         out_other = self.other_branch(other_features)
         out_concat = torch.cat([out_current, out_other], dim=1)
         out_fc = self.fc_stack(out_concat)
         output = self.output_layer(out_fc)
         return output
-    
