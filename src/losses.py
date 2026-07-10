@@ -43,10 +43,17 @@ NOT the input-specific Sin/Exp pre-layer branches. This requires
 BatteryPINN_Cho2022 (src/models/fcn_cho2022.py) to expose a
 `shared_parameters()` method; added to that skeleton as a stub for Kieu.
 
-Loss_initial's exact definition (which sample(s) count as the initial
-condition, what's compared) is NOT yet confirmed -- compute_initial_loss is
-left as NotImplementedError until the leader/Strategic Planner specifies it.
-Everything else in this module is implemented and independently testable.
+Loss_initial (confirmed): MSE(T_pred(t_start), T_amb), evaluated only on
+samples flagged via is_initial_step (see BatteryDataset in
+src/data_loader.py, which now yields (x, y, is_initial_step) 3-tuples --
+NOT (x, y) as in the original Task 1 skeleton). This corrects a
+dimensional-mismatch typo in Cho 2022 eq. 6 (which literally compares the
+PDE residual f(t=0) to T_amb); the paper's own text clarifies the intended
+meaning is "the initial condition where no current flows and battery
+temperature equals ambient temperature," i.e. a constraint on predicted
+TEMPERATURE, not on f. See compute_initial_loss below.
+
+This module is now fully implemented.
 """
 from typing import Dict, Iterable, Tuple
 
@@ -101,14 +108,12 @@ class AdaptivePINNLoss(nn.Module):
     lambda1, lambda2 : nn.Parameter
         Trainable Lumped Capacitance Model coefficients. Arbitrary small
         positive initial values (0.01) -- not specified by the equation, so
-        treated as ordinary learnable weights. Must be included in the
-        optimizer's parameter list alongside the model's own parameters,
-        e.g.:
-            optimizer = torch.optim.Adam(
-                list(model.parameters()) + list(loss_fn.parameters()), lr=...
-            )
-        (loss_fn.parameters() picks these up automatically since they're
-        registered via nn.Parameter on this nn.Module.)
+        treated as ordinary learnable weights. NOTE: since `model` is stored
+        as `self.model` (a registered submodule), `loss_fn.parameters()`
+        ALREADY includes every model parameter plus lambda1/lambda2 -- do
+        not also pass `model.parameters()` to the optimizer, that double-
+        counts them:
+            optimizer = torch.optim.Adam(loss_fn.parameters(), lr=...)
     """
 
     def __init__(
@@ -264,22 +269,51 @@ class AdaptivePINNLoss(nn.Module):
             return torch.tensor(0.0, device=loss.device)
         return torch.cat(abs_vals).mean()
 
-    def compute_initial_loss(self, x: Tensor, y_true: Tensor, T_pred_scaled: Tensor) -> Tensor:
-        """Loss_initial -- the initial-condition term in Cho 2022's total loss.
+    def compute_initial_loss(
+        self, x: Tensor, y_true: Tensor, T_pred_scaled: Tensor, is_initial_step: Tensor
+    ) -> Tensor:
+        """Loss_initial = MSE(T_pred(t_start), T_amb).
 
-        NOT YET IMPLEMENTED: which sample(s) constitute "the initial
-        condition" and what's being compared is not yet confirmed by the
-        leader/Strategic Planner (e.g. anchoring predicted Temperature at
-        t=0 of each trajectory to the measured initial temperature is one
-        plausible reading, but not confirmed -- do not guess at this without
-        instruction, it's core math per project rule).
+        Confirmed definition (corrects Cho 2022 eq. 6's dimensional-mismatch
+        typo, which literally compares the PDE residual f(t=0) to T_amb --
+        not dimensionally valid; the paper's own text clarifies the intent is
+        "the initial condition where no current flows and the battery
+        temperature equals ambient temperature"): MSE between the model's
+        predicted temperature at each trajectory's t_start and T_amb,
+        evaluated ONLY on samples flagged as that anchor point.
 
-        Signature is provisional (same batch tensors as the other loss terms)
-        and may need to change -- e.g. to a dedicated always-included t=0
-        anchor sample rather than whatever happens to be in this batch --
-        once the definition is confirmed.
+        Parameters
+        ----------
+        x, T_pred_scaled : see compute_physics_loss (T_pred_scaled must be
+            connected to the same forward pass, though only T_pred_scaled is
+            used here).
+        y_true : Tensor, shape (batch, 1)
+            Unused here (ground-truth Temperature isn't part of this term --
+            we compare the prediction to the constant T_amb, not to data)
+            but kept in the signature for a consistent call pattern across
+            all three compute_*_loss methods.
+        is_initial_step : Tensor, shape (batch,)
+            From BatteryDataset (src/data_loader.py): 1.0 for the sample(s)
+            that are the trajectory's t_start anchor, 0.0 otherwise. Each
+            DST/FUDS trajectory has exactly one such row, so with
+            shuffle=True most batches will have this all-zero.
+
+        Returns
+        -------
+        Tensor, scalar
+            MSE over the flagged samples. If none are flagged in this batch,
+            returns a differentiable zero (connected to T_pred_scaled's
+            graph via multiplication, not a fresh detached constant) so
+            update_weights()'s autograd.grad calls stay well-defined.
         """
-        raise NotImplementedError("Leader: implement Loss_initial once its exact definition is confirmed")
+        mask = is_initial_step.to(dtype=torch.bool).flatten()
+        if not torch.any(mask):
+            return T_pred_scaled.sum() * 0.0
+
+        T_real = self._unscale(T_pred_scaled, self.target_min, self.target_max)
+        T_initial_pred = T_real[mask]
+        T_amb_target = torch.full_like(T_initial_pred, self.ambient_temp_c)
+        return nn.functional.mse_loss(T_initial_pred, T_amb_target)
 
     def update_weights(
         self, data_loss: Tensor, physics_loss: Tensor, initial_loss: Tensor
@@ -321,7 +355,9 @@ class AdaptivePINNLoss(nn.Module):
 
         return self.alpha, self.beta
 
-    def forward(self, x: Tensor, y_true: Tensor) -> Tuple[Tensor, Dict[str, float]]:
+    def forward(
+        self, x: Tensor, y_true: Tensor, is_initial_step: Tensor
+    ) -> Tuple[Tensor, Dict[str, float]]:
         """Compute the total adaptively-weighted loss for one training step.
 
             Loss_total = Loss_data + alpha * Loss_PDE + beta * Loss_initial
@@ -338,6 +374,9 @@ class AdaptivePINNLoss(nn.Module):
             possibly-detached y_pred.
         y_true : Tensor, shape (batch, 1)
             Ground-truth target for this batch (scaled space).
+        is_initial_step : Tensor, shape (batch,)
+            Third element yielded by BatteryDataset/DataLoader -- see
+            compute_initial_loss.
 
         Returns
         -------
@@ -345,17 +384,13 @@ class AdaptivePINNLoss(nn.Module):
             (total_loss, log_dict) where log_dict contains
             {"data_loss", "physics_loss", "initial_loss", "alpha", "beta",
             "lambda1", "lambda2"} for logging in scripts/train_fcn.py.
-
-        Note: raises NotImplementedError via compute_initial_loss until that
-        term's definition is confirmed -- data_loss/physics_loss are usable
-        independently in the meantime (see module docstring).
         """
         x = x.clone().requires_grad_(True)
         T_pred_scaled = self.model(x)
 
         data_loss = self.compute_data_loss(T_pred_scaled, y_true)
         physics_loss = self.compute_physics_loss(x, T_pred_scaled)
-        initial_loss = self.compute_initial_loss(x, y_true, T_pred_scaled)
+        initial_loss = self.compute_initial_loss(x, y_true, T_pred_scaled, is_initial_step)
 
         alpha, beta = self.update_weights(data_loss, physics_loss, initial_loss)
         total_loss = data_loss + alpha * physics_loss + beta * initial_loss

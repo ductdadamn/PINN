@@ -19,11 +19,14 @@ All four files currently exist as **skeletons**: fully-typed signatures, detaile
 
 This is what lets all 4 pieces plug together without renegotiating interfaces mid-sprint:
 
-- **Features** (from `src.data_loader.BatteryDataset`): `Tensor` shape `(batch, 4)`, order `[Time, Current, Voltage, OCV_Estimated]`, Min-Max scaled to `[0,1]`.
-- **Target**: `Tensor` shape `(batch, 1)`, Temperature, Min-Max scaled to `[0,1]` (scaler fit on DST train set only — see `src/data_loader.py`'s handoff for why).
+- **`BatteryDataset.__getitem__`** *(breaking change from Task 1 — see below)*: returns `(x, y, is_initial_step)`, NOT `(x, y)`.
+  - `x`: `Tensor` shape `(batch, 4)`, order `[Time, Current, Voltage, OCV_Estimated]`, Min-Max scaled to `[0,1]`.
+  - `y`: `Tensor` shape `(batch, 1)`, Temperature, Min-Max scaled to `[0,1]` (scaler fit on DST train set only — see `src/data_loader.py`'s handoff for why).
+  - `is_initial_step`: `Tensor` shape `(batch,)`, 1.0 for the one row per trajectory that's the t_start anchor, 0.0 otherwise. Needed for `Loss_initial` (see below); if you don't need it (e.g. `evaluate.py`), just unpack and discard: `for x, y, _ in loader:`.
 - **`BatteryPINN_Cho2022.forward(x)`**: input `(batch, 4)` → output `(batch, 1)`. Same shape as the target tensor, so it can be compared directly.
 - **`BatteryPINN_Cho2022.shared_parameters()`** *(new requirement)*: returns only the parameters of the shared 4x145 FC + output stack (not the Sin/Exp pre-layer branches). Required by `AdaptivePINNLoss.update_weights()` — see below.
-- **`AdaptivePINNLoss.forward(x, y_true)`** *(updated from the original skeleton — see below)*: returns `(total_loss: Tensor, log_dict: Dict[str, float])`. `log_dict` includes `data_loss`, `physics_loss`, `initial_loss`, `alpha`, `beta`, `lambda1`, `lambda2` — `train_fcn.py` should log these per epoch.
+- **`AdaptivePINNLoss.forward(x, y_true, is_initial_step)`** *(updated from the original skeleton — see below)*: returns `(total_loss: Tensor, log_dict: Dict[str, float])`. `log_dict` includes `data_loss`, `physics_loss`, `initial_loss`, `alpha`, `beta`, `lambda1`, `lambda2` — `train_fcn.py` should log these per epoch.
+- **Optimizer**: `torch.optim.Adam(loss_fn.parameters(), lr=...)` — NOT `model.parameters() + loss_fn.parameters()`. `model` is a registered submodule of `loss_fn`, so `loss_fn.parameters()` already includes every model parameter plus `lambda1`/`lambda2`; concatenating both double-counts them (a real bug caught during a trial run, now fixed in `train_fcn.py`).
 
 > **Update since PR #2 merged:** the physics equation and the alpha/beta weighting formula are now both confirmed, which changed `AdaptivePINNLoss`'s interface from the original skeleton:
 > - Constructor now requires `feature_scaler` and `target_scaler` (pass `train_dataset.feature_scaler` / `.target_scaler`), since the physics residual needs to unscale back to real units.

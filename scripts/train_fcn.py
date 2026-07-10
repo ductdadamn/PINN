@@ -56,20 +56,23 @@ def train(
     model : BatteryPINN_Cho2022
         Model to train (already moved to `device` by caller or here).
     train_loader : DataLoader
-        Yields (x, y) batches from the DST BatteryDataset:
-        x shape (batch, 4), y shape (batch, 1).
+        Yields (x, y, is_initial_step) 3-tuples from the DST BatteryDataset
+        (NOT (x, y) -- see src/data_loader.py's BatteryDataset docstring):
+        x shape (batch, 4), y shape (batch, 1), is_initial_step shape (batch,).
     loss_fn : AdaptivePINNLoss
-        Combines data + physics loss (Lumped Capacitance Model residual).
-        IMPORTANT: loss_fn.forward(x, y) now runs `model(x)` internally
+        Combines data + physics (PDE) + initial-condition loss. IMPORTANT:
+        loss_fn.forward(x, y, is_initial_step) runs `model(x)` internally
         (needed so it can autograd dT/dt w.r.t. the raw input) -- do NOT
-        call model(x) yourself and pass y_pred in; pass the raw batch x
-        straight to loss_fn. See src/losses.py's forward() docstring.
+        call model(x) yourself and pass y_pred in; pass the raw batch
+        straight through. See src/losses.py's forward() docstring.
     optimizer : torch.optim.Optimizer
-        Must include BOTH the model's and the loss's parameters, since
-        AdaptivePINNLoss owns trainable lambda1/lambda2:
-            optimizer = torch.optim.Adam(
-                list(model.parameters()) + list(loss_fn.parameters()), lr=...
-            )
+        Built from `loss_fn.parameters()` (NOT `model.parameters()` +
+        `loss_fn.parameters()` -- since `model` is a registered submodule of
+        `loss_fn`, the latter already includes every model parameter plus
+        the trainable lambda1/lambda2; concatenating both double-counts
+        model params, which caused a real "duplicate parameters" bug caught
+        during a trial run):
+            optimizer = torch.optim.Adam(loss_fn.parameters(), lr=...)
         (see main() below, already wired this way)
     epochs : int
         Number of training epochs.
@@ -84,19 +87,20 @@ def train(
     Expected steps (TODO for Cam)
     ------------------------------
     1. model.train()
-    2. for each epoch: for each (x, y) batch:
-         - move x, y to device
+    2. for each epoch: for each (x, y, is_initial_step) batch:
+         - move x, y, is_initial_step to device
          - optimizer.zero_grad()
-         - loss, log_dict = loss_fn(x, y)
+         - loss, log_dict = loss_fn(x, y, is_initial_step)
          - loss.backward()
          - optimizer.step()
        accumulate/log metrics (e.g. print epoch loss, alpha, beta from log_dict)
     3. return model
 
-    Note: loss_fn.update_weights() (the alpha/beta EMA rule) is still a
-    NotImplementedError stub in src/losses.py as of this skeleton -- this
-    loop will raise until the leader fills that in. Everything else
-    (compute_data_loss, compute_physics_loss) is implemented and testable.
+    Note: src/losses.py's AdaptivePINNLoss is fully implemented now (data,
+    physics, and initial-condition losses, plus the Cho 2022 Adaptive
+    Normalization alpha/beta update) -- this loop is only blocked on
+    BatteryPINN_Cho2022.forward()/shared_parameters() (Kieu's file), not on
+    anything here in src/losses.py.
     """
     raise NotImplementedError("Cam: implement the training loop")
 
@@ -120,9 +124,10 @@ def main() -> None:
         feature_scaler=train_dataset.feature_scaler,
         target_scaler=train_dataset.target_scaler,
     ).to(args.device)
-    optimizer = torch.optim.Adam(
-        list(model.parameters()) + list(loss_fn.parameters()), lr=args.lr
-    )
+    # loss_fn.parameters() already includes model's parameters (model is a
+    # registered submodule of loss_fn) plus lambda1/lambda2 -- do not also
+    # pass model.parameters(), that double-counts them.
+    optimizer = torch.optim.Adam(loss_fn.parameters(), lr=args.lr)
 
     model = train(model, train_loader, loss_fn, optimizer, args.epochs, args.device)
     save_checkpoint(model, args.checkpoint_path)

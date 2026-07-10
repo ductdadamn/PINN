@@ -219,6 +219,15 @@ class BatteryDataset(Dataset):
     suitable for the current FCN. sequence_length>1 returns sliding-window 3D
     samples: (sequence_length, n_features), ready for an LSTM later -- same
     class, no interface change needed when upgrading.
+
+    __getitem__ returns a 3-tuple (x, y, is_initial_step) -- NOT (x, y). The
+    third element flags whether this sample is the trajectory's initial
+    condition anchor (row 0 of the DST/FUDS segment -- the first sample after
+    the pre-drive-cycle rest, i.e. t_start with SOC=1.0), needed by
+    AdaptivePINNLoss.compute_initial_loss (src/losses.py) per Cho 2022's
+    Loss_initial = MSE(T_pred(t_start), T_amb). Each segment has exactly one
+    such row, so with shuffle=True most batches will have is_initial_step
+    all-zero -- that's expected, not a bug.
     """
 
     def __init__(
@@ -251,6 +260,14 @@ class BatteryDataset(Dataset):
         self.features = features.astype(np.float32)
         self.target = target.astype(np.float32)
 
+        # Row 0 of the (already-segmented, reset_index'd) df is the
+        # trajectory's t_start / initial-condition anchor -- see class
+        # docstring. Indexed the same way as __getitem__'s window-start
+        # `idx`, so this works unchanged for both point-wise and windowed
+        # (sequence_length>1) sampling.
+        self.is_initial_step = np.zeros(len(df), dtype=np.float32)
+        self.is_initial_step[0] = 1.0
+
     def __len__(self):
         if self.sequence_length == 1:
             return len(self.features)
@@ -263,7 +280,8 @@ class BatteryDataset(Dataset):
         else:
             x = self.features[idx: idx + self.sequence_length]  # (seq_len, n_features)
             y = self.target[idx + self.sequence_length - 1]  # target at window end
-        return torch.from_numpy(x), torch.from_numpy(y)
+        is_initial = self.is_initial_step[idx]
+        return torch.from_numpy(x), torch.from_numpy(y), torch.tensor(is_initial, dtype=torch.float32)
 
 
 # ---------------------------------------------------------------------------

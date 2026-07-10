@@ -59,10 +59,14 @@ def run_inference(model: BatteryPINN_Cho2022, test_loader: DataLoader, device: s
     model : BatteryPINN_Cho2022
         Trained model in eval() mode.
     test_loader : DataLoader
-        Yields (x, y) batches from the FUDS BatteryDataset:
-        x shape (batch, 4), y shape (batch, 1). Note: y is Min-Max SCALED
-        (same scaler fit on DST train set, see src/data_loader.build_datasets) --
-        inverse-transform before computing RMSE/MAE in real-world units (deg C).
+        Yields (x, y, is_initial_step) 3-tuples from the FUDS BatteryDataset
+        (NOT (x, y) -- see src/data_loader.py's BatteryDataset docstring):
+        x shape (batch, 4), y shape (batch, 1). is_initial_step isn't needed
+        for plain inference (that's a training-time loss term) -- just
+        unpack and discard it, e.g. `for x, y, _ in test_loader:`. Note: y is
+        Min-Max SCALED (same scaler fit on DST train set, see
+        src/data_loader.build_datasets) -- inverse-transform before computing
+        RMSE/MAE in real-world units (deg C).
     device : str
         "cuda" or "cpu".
 
