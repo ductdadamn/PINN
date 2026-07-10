@@ -8,17 +8,17 @@ FUDS (test) split, compute RMSE/MAE, and save a Predicted-vs-True Temperature
 plot. This is the script that should demonstrate the FCN's failure to
 generalize to the unseen dynamic-load profile (per Sprint 2's goal).
 
-Run (once implemented):
-    .venv/bin/python scripts/evaluate.py --checkpoint-path outputs/checkpoints/fcn_cho2022.pth
-
-SKELETON ONLY -- inference/metric/plotting logic intentionally left
-unimplemented.
+Run:
+    .venv/bin/python scripts/evaluate.py --raw-dir PINN_dataset --checkpoint-path outputs/checkpoints/fcn_cho2022.pth
 """
 import argparse
 import os
 import sys
 
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
+from sklearn.metrics import mean_absolute_error, mean_squared_error
 from torch.utils.data import DataLoader
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -26,12 +26,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.data_loader import build_datasets  # noqa: E402
 from src.models.fcn_cho2022 import BatteryPINN_Cho2022  # noqa: E402
 
+DEFAULT_RAW_DIR = "data/raw"
 DEFAULT_CHECKPOINT_PATH = "outputs/checkpoints/fcn_cho2022.pth"
 DEFAULT_PLOT_PATH = "outputs/figures/fcn_predicted_vs_true.png"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate the Cho2022 FCN baseline on FUDS data")
+    parser.add_argument("--raw-dir", type=str, default=DEFAULT_RAW_DIR)
     parser.add_argument("--checkpoint-path", type=str, default=DEFAULT_CHECKPOINT_PATH)
     parser.add_argument("--plot-path", type=str, default=DEFAULT_PLOT_PATH)
     parser.add_argument("--batch-size", type=int, default=32)
@@ -48,7 +50,12 @@ def load_model(checkpoint_path: str, device: str) -> BatteryPINN_Cho2022:
     BatteryPINN_Cho2022
         Model in eval() mode, on `device`.
     """
-    raise NotImplementedError("Kem: implement checkpoint loading (torch.load + load_state_dict)")
+    model = BatteryPINN_Cho2022()
+    state_dict = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    model.load_state_dict(state_dict)
+    model.to(device)
+    model.eval()
+    return model
 
 
 def run_inference(model: BatteryPINN_Cho2022, test_loader: DataLoader, device: str):
@@ -79,7 +86,25 @@ def run_inference(model: BatteryPINN_Cho2022, test_loader: DataLoader, device: s
     3. inverse-transform both using the target scaler from build_datasets()'s
        meta / the BatteryDataset instance (test_dataset.target_scaler)
     """
-    raise NotImplementedError("Kem: implement inference loop")
+    model.eval()
+    y_true_scaled = []
+    y_pred_scaled = []
+
+    with torch.no_grad():
+        for x, y in test_loader:
+            x = x.to(device)
+            y_pred = model(x)
+            y_true_scaled.append(y.cpu().numpy())
+            y_pred_scaled.append(y_pred.cpu().numpy())
+
+    y_true_scaled = np.concatenate(y_true_scaled, axis=0)
+    y_pred_scaled = np.concatenate(y_pred_scaled, axis=0)
+
+    target_scaler = test_loader.dataset.target_scaler
+    y_true = target_scaler.inverse_transform(y_true_scaled).ravel()
+    y_pred = target_scaler.inverse_transform(y_pred_scaled).ravel()
+
+    return y_true, y_pred
 
 
 def compute_metrics(y_true, y_pred) -> dict:
@@ -91,7 +116,9 @@ def compute_metrics(y_true, y_pred) -> dict:
     dict
         {"rmse": float, "mae": float}
     """
-    raise NotImplementedError("Kem: implement RMSE/MAE computation")
+    rmse = float(np.sqrt(mean_squared_error(y_true, y_pred)))
+    mae = float(mean_absolute_error(y_true, y_pred))
+    return {"rmse": rmse, "mae": mae}
 
 
 def plot_predictions(y_true, y_pred, save_path: str) -> None:
@@ -102,14 +129,25 @@ def plot_predictions(y_true, y_pred, save_path: str) -> None:
     as needed (see scripts/test_loader.py for the os.makedirs pattern used
     in Task 1).
     """
-    raise NotImplementedError("Kem: implement prediction plot")
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.plot(y_true, label="True Temperature", color="tab:blue", linewidth=1)
+    ax.plot(y_pred, label="Predicted Temperature", color="tab:orange", linewidth=1)
+    ax.set_xlabel("Sample index")
+    ax.set_ylabel("Temperature (deg C)")
+    ax.set_title("FCN Predicted vs True Temperature (FUDS test set)")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=150)
+    plt.close(fig)
 
 
 def main() -> None:
     args = parse_args()
 
     _train_dataset, test_dataset, _meta = build_datasets(
-        raw_dir="data/raw", sequence_length=args.sequence_length
+        raw_dir=args.raw_dir, sequence_length=args.sequence_length
     )
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
 
