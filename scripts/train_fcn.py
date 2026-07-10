@@ -23,7 +23,7 @@ from torch.utils.data import DataLoader
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.data_loader import build_datasets  # noqa: E402
+from src.data_loader import AnchorInclusiveBatchSampler, build_datasets  # noqa: E402
 from src.losses import AdaptivePINNLoss  # noqa: E402
 from src.models.fcn_cho2022 import BatteryPINN_Cho2022  # noqa: E402
 
@@ -56,13 +56,28 @@ def train(
     model : BatteryPINN_Cho2022
         Model to train (already moved to `device` by caller or here).
     train_loader : DataLoader
-        Yields (x, y) batches from the DST BatteryDataset:
-        x shape (batch, 4), y shape (batch, 1).
+        Yields (x, y, is_initial_step) 3-tuples from the DST BatteryDataset
+        (NOT (x, y) -- see src/data_loader.py's BatteryDataset docstring):
+        x shape (batch, 4), y shape (batch, 1), is_initial_step shape (batch,).
+        Built with batch_sampler=AnchorInclusiveBatchSampler (see main()),
+        NOT plain shuffle=True -- guarantees the t_start anchor row is in
+        every batch, which Loss_initial's gradient-ratio weighting needs
+        (see AnchorInclusiveBatchSampler's docstring for why).
     loss_fn : AdaptivePINNLoss
-        Combines data + physics loss; see src/losses.py for its forward()
-        contract (returns (total_loss, log_dict)).
+        Combines data + physics (PDE) + initial-condition loss. IMPORTANT:
+        loss_fn.forward(x, y, is_initial_step) runs `model(x)` internally
+        (needed so it can autograd dT/dt w.r.t. the raw input) -- do NOT
+        call model(x) yourself and pass y_pred in; pass the raw batch
+        straight through. See src/losses.py's forward() docstring.
     optimizer : torch.optim.Optimizer
-        e.g. torch.optim.Adam(model.parameters(), lr=...).
+        Built from `loss_fn.parameters()` (NOT `model.parameters()` +
+        `loss_fn.parameters()` -- since `model` is a registered submodule of
+        `loss_fn`, the latter already includes every model parameter plus
+        the trainable lambda1/lambda2; concatenating both double-counts
+        model params, which caused a real "duplicate parameters" bug caught
+        during a trial run):
+            optimizer = torch.optim.Adam(loss_fn.parameters(), lr=...)
+        (see main() below, already wired this way)
     epochs : int
         Number of training epochs.
     device : str
@@ -76,16 +91,20 @@ def train(
     Expected steps (TODO for Cam)
     ------------------------------
     1. model.train()
-    2. for each epoch: for each (x, y) batch:
-         - move x, y to device
+    2. for each epoch: for each (x, y, is_initial_step) batch:
+         - move x, y, is_initial_step to device
          - optimizer.zero_grad()
-         - y_pred = model(x)
-         - loss, log_dict = loss_fn(y_pred, y, ...)  # physics_inputs TBD once
-           compute_physics_loss is implemented
+         - loss, log_dict = loss_fn(x, y, is_initial_step)
          - loss.backward()
          - optimizer.step()
        accumulate/log metrics (e.g. print epoch loss, alpha, beta from log_dict)
     3. return model
+
+    Note: src/losses.py's AdaptivePINNLoss is fully implemented now (data,
+    physics, and initial-condition losses, plus the Cho 2022 Adaptive
+    Normalization alpha/beta update) -- this loop is only blocked on
+    BatteryPINN_Cho2022.forward()/shared_parameters() (Kieu's file), not on
+    anything here in src/losses.py.
     """
     raise NotImplementedError("Cam: implement the training loop")
 
@@ -101,11 +120,21 @@ def main() -> None:
     train_dataset, _test_dataset, _meta = build_datasets(
         raw_dir="data/raw", sequence_length=args.sequence_length
     )
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+    train_sampler = AnchorInclusiveBatchSampler(
+        len(train_dataset), batch_size=args.batch_size, anchor_indices=(0,), shuffle=True
+    )
+    train_loader = DataLoader(train_dataset, batch_sampler=train_sampler)
 
     model = BatteryPINN_Cho2022().to(args.device)
-    loss_fn = AdaptivePINNLoss(model)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    loss_fn = AdaptivePINNLoss(
+        model,
+        feature_scaler=train_dataset.feature_scaler,
+        target_scaler=train_dataset.target_scaler,
+    ).to(args.device)
+    # loss_fn.parameters() already includes model's parameters (model is a
+    # registered submodule of loss_fn) plus lambda1/lambda2 -- do not also
+    # pass model.parameters(), that double-counts them.
+    optimizer = torch.optim.Adam(loss_fn.parameters(), lr=args.lr)
 
     model = train(model, train_loader, loss_fn, optimizer, args.epochs, args.device)
     save_checkpoint(model, args.checkpoint_path)
