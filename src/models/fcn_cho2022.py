@@ -47,14 +47,15 @@ class SinActivation(nn.Module):
     """sin(x) activation, used on the Current pre-layer branch."""
 
     def forward(self, x: Tensor) -> Tensor:
-        raise NotImplementedError("Kieu: implement sin activation")
+        return torch.sin(x)
 
 
 class ExpActivation(nn.Module):
     """exp(x) activation, used on the [Time, Voltage, OCV_Estimated] pre-layer branch."""
 
     def forward(self, x: Tensor) -> Tensor:
-        raise NotImplementedError("Kieu: implement exp activation (watch for overflow)")
+        # clamp to avoid float32 overflow (exp(x) overflows past x~88.7)
+        return torch.exp(torch.clamp(x, max=88.0))
 
 
 class BatteryPINN_Cho2022(nn.Module):
@@ -128,7 +129,13 @@ class BatteryPINN_Cho2022(nn.Module):
         Tensor, shape (batch, output_dim)
             Predicted temperature.
         """
-        raise NotImplementedError(
-            "Kieu: split x into Current vs [Time, Voltage, OCV_Estimated], "
-            "run pre-layers, concat, run 4x145 FC stack, output layer"
-        )
+        # Current is index 1; [Time, Voltage, OCV_Estimated] are indices [0, 2, 3]
+        current = x[:, [1]]  # Shape: (batch, 1)
+        other_features = x[:, [0, 2, 3]]  # Shape: (batch, 3)
+
+        out_current = self.current_branch(current)
+        out_other = self.other_branch(other_features)
+        out_concat = torch.cat([out_current, out_other], dim=1)
+        out_fc = self.fc_stack(out_concat)
+        output = self.output_layer(out_fc)
+        return output
