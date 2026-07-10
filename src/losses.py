@@ -25,9 +25,28 @@ explicitly unscaled back to real units (via the fitted scalers' data_min_/
 data_max_, applied as differentiable tensor ops so the autograd graph stays
 intact) before the residual is evaluated. See compute_physics_loss below.
 
-alpha/beta update rule (update_weights) is intentionally left unimplemented
-pending the exact formula from the leader -- do not guess at this; it's core
-math per project rule.
+alpha/beta update rule: Cho 2022's "Adaptive Normalization" scheme (NOT the
+more common single-weight gradient-balancing scheme -- both alpha and beta
+adapt, and Loss_data itself is unweighted):
+
+    Loss_total = Loss_data + alpha * Loss_PDE + beta * Loss_initial
+
+    alpha_hat = max(|grad Loss_data|) / mean(|grad Loss_PDE|)
+    beta_hat  = max(|grad Loss_data|) / mean(|grad Loss_initial|)
+    alpha = (1 - gamma) * alpha_prev + gamma * alpha_hat
+    beta  = (1 - gamma) * beta_prev  + gamma * beta_hat
+    gamma = 0.9
+
+Gradients above are computed w.r.t. the model's SHARED last-layer weights
+only (model.shared_parameters()) -- the concat -> 4x145 FC -> output stack,
+NOT the input-specific Sin/Exp pre-layer branches. This requires
+BatteryPINN_Cho2022 (src/models/fcn_cho2022.py) to expose a
+`shared_parameters()` method; added to that skeleton as a stub for Kieu.
+
+Loss_initial's exact definition (which sample(s) count as the initial
+condition, what's compared) is NOT yet confirmed -- compute_initial_loss is
+left as NotImplementedError until the leader/Strategic Planner specifies it.
+Everything else in this module is implemented and independently testable.
 """
 from typing import Dict, Iterable, Tuple
 
@@ -59,12 +78,13 @@ class AdaptivePINNLoss(nn.Module):
         The scaler fit on the TRAIN (DST) target -- pass
         `train_dataset.target_scaler`.
     alpha_init : float
-        Initial weight for the data loss term.
+        Initial weight for the physics (PDE) loss term.
     beta_init : float
-        Initial weight for the physics loss term.
-    ema_decay : float
-        Decay factor for the moving average used to smooth alpha/beta updates
-        across steps (closer to 1.0 = slower/smoother adaptation).
+        Initial weight for the initial-condition loss term.
+    gamma : float
+        Moving-average update weight (per Cho 2022; note this is the weight
+        on the NEW estimate, not the old one -- gamma=0.9 means each update
+        is 90% the fresh gradient-ratio estimate, 10% the previous value).
     ambient_temp_c : float
         Chamber/ambient temperature T_amb in the Lumped Capacitance Model,
         in degrees C. Default 25.0 -- inferred from the "-25-" in the raw
@@ -75,9 +95,9 @@ class AdaptivePINNLoss(nn.Module):
     Attributes
     ----------
     alpha : float
-        Current adaptive weight applied to the data loss term.
+        Current adaptive weight applied to the physics (PDE) loss term.
     beta : float
-        Current adaptive weight applied to the physics loss term.
+        Current adaptive weight applied to the initial-condition loss term.
     lambda1, lambda2 : nn.Parameter
         Trainable Lumped Capacitance Model coefficients. Arbitrary small
         positive initial values (0.01) -- not specified by the equation, so
@@ -98,14 +118,14 @@ class AdaptivePINNLoss(nn.Module):
         target_scaler: MinMaxScaler,
         alpha_init: float = 1.0,
         beta_init: float = 1.0,
-        ema_decay: float = 0.9,
+        gamma: float = 0.9,
         ambient_temp_c: float = 25.0,
     ) -> None:
         super().__init__()
         self.model = model
         self.alpha_init = alpha_init
         self.beta_init = beta_init
-        self.ema_decay = ema_decay
+        self.gamma = gamma
         self.alpha: float = alpha_init
         self.beta: float = beta_init
         self.ambient_temp_c = ambient_temp_c
@@ -230,34 +250,81 @@ class AdaptivePINNLoss(nn.Module):
             return torch.tensor(0.0, device=loss.device)
         return torch.stack(abs_maxes).max()
 
-    def update_weights(self, data_loss: Tensor, physics_loss: Tensor) -> Tuple[float, float]:
-        """Update self.alpha / self.beta via an EMA of a gradient-balancing
-        ratio between compute_data_loss and compute_physics_loss.
+    def _mean_abs_grad(self, loss: Tensor, params: Iterable[Tensor]) -> Tensor:
+        """Compute mean(|grad_theta loss|) -- the mean-magnitude gradient of
+        `loss` with respect to `params`, pooled elementwise across all given
+        parameter tensors.
 
-        NOT YET IMPLEMENTED -- the exact update rule (which loss's max vs
-        mean, whether alpha is fixed at 1 or also adapts, EMA direction) is
-        pending confirmation from the leader/Strategic Planner. Do not guess
-        at this formula; it's core math per project rule. `_max_abs_grad` is
-        ready to use once the rule is specified.
+        Parameters / Returns: mirrors _max_abs_grad, but mean instead of max.
+        """
+        params = [p for p in params if p.requires_grad]
+        grads = torch.autograd.grad(loss, params, retain_graph=True, allow_unused=True)
+        abs_vals = [g.detach().abs().flatten() for g in grads if g is not None]
+        if not abs_vals:
+            return torch.tensor(0.0, device=loss.device)
+        return torch.cat(abs_vals).mean()
+
+    def compute_initial_loss(self, x: Tensor, y_true: Tensor, T_pred_scaled: Tensor) -> Tensor:
+        """Loss_initial -- the initial-condition term in Cho 2022's total loss.
+
+        NOT YET IMPLEMENTED: which sample(s) constitute "the initial
+        condition" and what's being compared is not yet confirmed by the
+        leader/Strategic Planner (e.g. anchoring predicted Temperature at
+        t=0 of each trajectory to the measured initial temperature is one
+        plausible reading, but not confirmed -- do not guess at this without
+        instruction, it's core math per project rule).
+
+        Signature is provisional (same batch tensors as the other loss terms)
+        and may need to change -- e.g. to a dedicated always-included t=0
+        anchor sample rather than whatever happens to be in this batch --
+        once the definition is confirmed.
+        """
+        raise NotImplementedError("Leader: implement Loss_initial once its exact definition is confirmed")
+
+    def update_weights(
+        self, data_loss: Tensor, physics_loss: Tensor, initial_loss: Tensor
+    ) -> Tuple[float, float]:
+        """Cho 2022 Adaptive Normalization update for self.alpha / self.beta.
+
+            alpha_hat = max(|grad Loss_data|) / mean(|grad Loss_PDE|)
+            beta_hat  = max(|grad Loss_data|) / mean(|grad Loss_initial|)
+            alpha = (1 - gamma) * alpha_prev + gamma * alpha_hat
+            beta  = (1 - gamma) * beta_prev  + gamma * beta_hat
+
+        Gradients computed w.r.t. self.model.shared_parameters() only (the
+        shared 4x145 FC + output stack, not the input-specific pre-layer
+        branches), per Cho 2022.
 
         Parameters
         ----------
-        data_loss : Tensor, scalar
-            Current-step data loss (from compute_data_loss).
-        physics_loss : Tensor, scalar
-            Current-step physics loss (from compute_physics_loss).
+        data_loss, physics_loss, initial_loss : Tensor, scalar
+            Current-step losses from compute_data_loss / compute_physics_loss
+            / compute_initial_loss.
 
         Returns
         -------
         Tuple[float, float]
             Updated (alpha, beta), also stored on self.
         """
-        raise NotImplementedError("Leader: implement EMA-based alpha/beta update once formula is confirmed")
+        shared_params = list(self.model.shared_parameters())
+        eps = 1e-12  # numerical-stability guard against zero-gradient denominators; does not alter the formula in the normal case
+
+        max_grad_data = self._max_abs_grad(data_loss, shared_params)
+        mean_grad_pde = self._mean_abs_grad(physics_loss, shared_params)
+        mean_grad_initial = self._mean_abs_grad(initial_loss, shared_params)
+
+        alpha_hat = (max_grad_data / (mean_grad_pde + eps)).item()
+        beta_hat = (max_grad_data / (mean_grad_initial + eps)).item()
+
+        self.alpha = (1 - self.gamma) * self.alpha + self.gamma * alpha_hat
+        self.beta = (1 - self.gamma) * self.beta + self.gamma * beta_hat
+
+        return self.alpha, self.beta
 
     def forward(self, x: Tensor, y_true: Tensor) -> Tuple[Tensor, Dict[str, float]]:
         """Compute the total adaptively-weighted loss for one training step.
 
-        total_loss = alpha * data_loss + beta * physics_loss
+            Loss_total = Loss_data + alpha * Loss_PDE + beta * Loss_initial
 
         Parameters
         ----------
@@ -276,21 +343,27 @@ class AdaptivePINNLoss(nn.Module):
         -------
         Tuple[Tensor, Dict[str, float]]
             (total_loss, log_dict) where log_dict contains
-            {"data_loss", "physics_loss", "alpha", "beta", "lambda1", "lambda2"}
-            for logging in scripts/train_fcn.py.
+            {"data_loss", "physics_loss", "initial_loss", "alpha", "beta",
+            "lambda1", "lambda2"} for logging in scripts/train_fcn.py.
+
+        Note: raises NotImplementedError via compute_initial_loss until that
+        term's definition is confirmed -- data_loss/physics_loss are usable
+        independently in the meantime (see module docstring).
         """
         x = x.clone().requires_grad_(True)
         T_pred_scaled = self.model(x)
 
         data_loss = self.compute_data_loss(T_pred_scaled, y_true)
         physics_loss = self.compute_physics_loss(x, T_pred_scaled)
+        initial_loss = self.compute_initial_loss(x, y_true, T_pred_scaled)
 
-        alpha, beta = self.update_weights(data_loss, physics_loss)
-        total_loss = alpha * data_loss + beta * physics_loss
+        alpha, beta = self.update_weights(data_loss, physics_loss, initial_loss)
+        total_loss = data_loss + alpha * physics_loss + beta * initial_loss
 
         log_dict = {
             "data_loss": data_loss.item(),
             "physics_loss": physics_loss.item(),
+            "initial_loss": initial_loss.item(),
             "alpha": alpha,
             "beta": beta,
             "lambda1": self.lambda1.item(),

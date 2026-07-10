@@ -22,11 +22,13 @@ This is what lets all 4 pieces plug together without renegotiating interfaces mi
 - **Features** (from `src.data_loader.BatteryDataset`): `Tensor` shape `(batch, 4)`, order `[Time, Current, Voltage, OCV_Estimated]`, Min-Max scaled to `[0,1]`.
 - **Target**: `Tensor` shape `(batch, 1)`, Temperature, Min-Max scaled to `[0,1]` (scaler fit on DST train set only — see `src/data_loader.py`'s handoff for why).
 - **`BatteryPINN_Cho2022.forward(x)`**: input `(batch, 4)` → output `(batch, 1)`. Same shape as the target tensor, so it can be compared directly.
-- **`AdaptivePINNLoss.forward(x, y_true)`** *(updated from the original skeleton — see below)*: returns `(total_loss: Tensor, log_dict: Dict[str, float])`. `log_dict` includes `data_loss`, `physics_loss`, `alpha`, `beta`, `lambda1`, `lambda2` — `train_fcn.py` should log these per epoch.
+- **`BatteryPINN_Cho2022.shared_parameters()`** *(new requirement)*: returns only the parameters of the shared 4x145 FC + output stack (not the Sin/Exp pre-layer branches). Required by `AdaptivePINNLoss.update_weights()` — see below.
+- **`AdaptivePINNLoss.forward(x, y_true)`** *(updated from the original skeleton — see below)*: returns `(total_loss: Tensor, log_dict: Dict[str, float])`. `log_dict` includes `data_loss`, `physics_loss`, `initial_loss`, `alpha`, `beta`, `lambda1`, `lambda2` — `train_fcn.py` should log these per epoch.
 
-> **Update since PR #2 merged:** the physics equation is now confirmed (Lumped Capacitance Model, see below), which changed `AdaptivePINNLoss`'s interface from the original skeleton:
+> **Update since PR #2 merged:** the physics equation and the alpha/beta weighting formula are now both confirmed, which changed `AdaptivePINNLoss`'s interface from the original skeleton:
 > - Constructor now requires `feature_scaler` and `target_scaler` (pass `train_dataset.feature_scaler` / `.target_scaler`), since the physics residual needs to unscale back to real units.
 > - `forward(x, y_true)` now takes the **raw scaled input batch `x`**, not a precomputed `y_pred` — it runs `model(x)` internally so it can autograd `dT/dt` w.r.t. the input. **Do not call `model(x)` yourself and pass the output in.**
+> - Loss formula is **`Loss_total = Loss_data + alpha*Loss_PDE + beta*Loss_initial`** (Cho 2022 Adaptive Normalization) — note `Loss_data` itself is unweighted, unlike the original skeleton's `alpha*data + beta*physics` guess.
 > - The optimizer must include `loss_fn.parameters()` too (owns trainable `lambda1`, `lambda2`): `torch.optim.Adam(list(model.parameters()) + list(loss_fn.parameters()), lr=...)`.
 > - `scripts/train_fcn.py`'s `main()` and docstrings are already updated to match — Cam just needs to fill in the loop body per the updated TODO.
 - **Checkpoint**: `scripts/train_fcn.py` saves to `outputs/checkpoints/fcn_cho2022.pth` (via `model.state_dict()`); `scripts/evaluate.py` loads from the same default path. Both are `outputs/` (gitignored) — checkpoints are local artifacts, not committed.
@@ -35,14 +37,15 @@ This is what lets all 4 pieces plug together without renegotiating interfaces mi
 
 ### `src/losses.py` — Leader
 
-`AdaptivePINNLoss(nn.Module)` — **implemented**, except `update_weights`:
+`AdaptivePINNLoss(nn.Module)` — **implemented**, except `compute_initial_loss`:
 - `compute_data_loss(y_pred, y_true) -> Tensor` — MSE, done.
 - `compute_physics_loss(x, T_pred_scaled) -> Tensor` — Lumped Capacitance Model residual `f = dT/dt + lambda1*(V-V_ocv)*I + lambda2*(T_amb-T)`, `Loss = mean(f**2)`, done. Unscales all quantities back to real units before evaluating (see module docstring for why). `lambda1`/`lambda2` are trainable `nn.Parameter`s.
-- `_max_abs_grad(loss, params) -> Tensor` — `max(|∇θ loss|)` over given params, done.
-- `update_weights(data_loss, physics_loss) -> (alpha, beta)` — **still `NotImplementedError`**. EMA-based gradient-magnitude balancing; exact formula not yet confirmed (which loss's max vs mean, fixed vs adaptive alpha). `forward()` will raise until this is filled in — everything else is independently testable in the meantime.
-- `forward(x, y_true) -> (total_loss, log_dict)` — runs `model(x)` internally (see contract note above), done except for the `update_weights` call inside it.
+- `_max_abs_grad` / `_mean_abs_grad(loss, params) -> Tensor` — done.
+- `update_weights(data_loss, physics_loss, initial_loss) -> (alpha, beta)` — **done**. Cho 2022 Adaptive Normalization: `alpha_hat = max(|∇Loss_data|)/mean(|∇Loss_PDE|)`, `beta_hat = max(|∇Loss_data|)/mean(|∇Loss_initial|)`, both computed w.r.t. `model.shared_parameters()`, then EMA'd with `gamma=0.9`.
+- `compute_initial_loss(x, y_true, T_pred_scaled) -> Tensor` — **still `NotImplementedError`**. Exact definition (which sample(s) count as "initial", what's compared) not yet confirmed. `forward()` will raise here until it's filled in — everything else (including `update_weights`) is independently testable in the meantime.
+- `forward(x, y_true) -> (total_loss, log_dict)` — `Loss_total = Loss_data + alpha*Loss_PDE + beta*Loss_initial`, runs `model(x)` internally (see contract note above).
 
-Validated with a dummy stand-in model (since `BatteryPINN_Cho2022.forward` isn't implemented yet): gradients correctly flow into both `lambda1`/`lambda2` and the model's parameters through the physics residual term.
+Validated with a dummy stand-in model exposing `shared_parameters()` (since `BatteryPINN_Cho2022` isn't implemented yet): gradients correctly flow into `lambda1`/`lambda2` and the model's shared-layer parameters, and `alpha`/`beta` move correctly across successive `update_weights()` calls.
 
 ### `src/models/fcn_cho2022.py` — Kieu
 
@@ -52,6 +55,8 @@ Input(4) -> [Current -> Sin branch] + [Time,Voltage,OCV_Estimated -> Exp branch]
          -> Concat -> 4x FC(145) -> FC(1) output
 ```
 `SinActivation` / `ExpActivation` stub classes are provided for the two branches. Pre-layer output widths (before concat) aren't specified beyond the activation assignment — confirm exact dims with the leader/paper before finalizing `__init__`, since that's an architecture decision, not something to guess independently.
+
+**New requirement from `src/losses.py`:** keep the shared 4x145 FC + output stack in its own submodule (e.g. `self.shared_fc = nn.Sequential(...)`), separate from the Sin/Exp pre-layer branches, and implement `shared_parameters()` to return `self.shared_fc.parameters()`. `AdaptivePINNLoss`'s gradient-balancing scheme is defined specifically w.r.t. these shared weights (per Cho 2022) — it will raise `NotImplementedError` until this method returns real parameters.
 
 ### `scripts/train_fcn.py` — Cam
 
