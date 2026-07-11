@@ -73,6 +73,17 @@ Both forward() and update_weights() now take an `epoch: int` argument to
 implement this -- a required, breaking change to the Sprint 2 call
 signature. See their docstrings below.
 
+3D (SEQUENCE) INPUT SUPPORT, fixed while implementing Cam's train_lstm.py:
+compute_physics_loss previously indexed its input `x` assuming it was always
+2D (batch, features) -- e.g. x[:, time_idx:time_idx+1]. For a 3D (batch,
+seq_len, features) LSTM input, that silently selected a TIMESTEP across all
+features instead of a FEATURE across timesteps (wrong axis, but shape-
+compatible enough via broadcasting to not crash -- confirmed empirically).
+Fixed via _extract_col(), which pulls the LAST timestep's column for 3D
+input (the timestep the model's output corresponds to) and behaves exactly
+as before for 2D input. The physics equation itself is unchanged -- this is
+purely a shape-handling generalization, not a math change.
+
 This module is now fully implemented.
 """
 from typing import Dict, Iterable, Tuple
@@ -208,6 +219,31 @@ class AdaptivePINNLoss(nn.Module):
         which would detach from autograd)."""
         return x_col * (col_max - col_min) + col_min
 
+    def _extract_col(self, x: Tensor, col_idx: int) -> Tensor:
+        """Extract feature column `col_idx` as a (batch, 1) tensor, from
+        EITHER a 2D (batch, features) point-wise input (Sprint 2 FCN) OR a
+        3D (batch, seq_len, features) sequence input (Sprint 3 LSTM).
+
+        For the 3D case, uses the LAST timestep only (x[:, -1, col_idx]) --
+        that's the timestep BatteryDataset's target/T_pred_scaled
+        corresponds to (see its docstring: target is "current step", i.e.
+        the window's last row), so evaluating the physics residual at that
+        same timestep is the natural generalization of the 2D case, not an
+        arbitrary choice. Works identically on x itself and on
+        torch.autograd.grad(...)'s output w.r.t. x (same shape as x).
+
+        BUG THIS FIXES: before this helper existed, compute_physics_loss
+        indexed x directly with x[:, col_idx:col_idx+1] regardless of x's
+        rank. For 3D x that silently selects a TIMESTEP across all
+        features (wrong axis), not a FEATURE across all timesteps -- it
+        does not crash (broadcasting still "succeeds" with a nonsensical
+        shape), it just silently corrupts physics_loss/initial_loss.
+        Confirmed empirically before this fix.
+        """
+        if x.dim() == 3:
+            return x[:, -1, col_idx: col_idx + 1]
+        return x[:, col_idx: col_idx + 1]
+
     def compute_physics_loss(self, x: Tensor, T_pred_scaled: Tensor) -> Tensor:
         """Lumped Capacitance Model residual loss.
 
@@ -219,11 +255,14 @@ class AdaptivePINNLoss(nn.Module):
 
         Parameters
         ----------
-        x : Tensor, shape (batch, len(FEATURE_COLS)), requires_grad=True
+        x : Tensor, requires_grad=True
             SCALED model input (same tensor passed to `self.model`), columns
             ordered per FEATURE_COLS = [Time, Current, Voltage, OCV_Estimated].
-            Caller (forward()) is responsible for setting requires_grad=True
-            before calling self.model(x), so d(T_pred)/d(x) is defined.
+            Shape EITHER (batch, len(FEATURE_COLS)) (Sprint 2 point-wise FCN)
+            OR (batch, seq_len, len(FEATURE_COLS)) (Sprint 3 sequence LSTM) --
+            see _extract_col for how the 3D case is handled. Caller
+            (forward()) is responsible for setting requires_grad=True before
+            calling self.model(x), so d(T_pred)/d(x) is defined.
         T_pred_scaled : Tensor, shape (batch, 1)
             self.model(x) -- MUST be connected to x's autograd graph (i.e.
             computed from this exact x, not detached / a copy).
@@ -243,6 +282,7 @@ class AdaptivePINNLoss(nn.Module):
 
         # dT_real/d(x_time_scaled) via autograd; create_graph=True so this
         # term can itself be backpropagated into the model's parameters.
+        # dT_dx has the SAME SHAPE as x (2D or 3D) -- _extract_col handles both.
         dT_dx = torch.autograd.grad(
             outputs=T_real,
             inputs=x,
@@ -250,7 +290,7 @@ class AdaptivePINNLoss(nn.Module):
             create_graph=True,
             retain_graph=True,
         )[0]
-        dT_dtscaled = dT_dx[:, time_idx: time_idx + 1]
+        dT_dtscaled = self._extract_col(dT_dx, time_idx)
 
         # Chain rule: t_scaled = (t_real - t_min)/(t_max - t_min)
         #   => d(t_scaled)/d(t_real) = 1/(t_max - t_min)
@@ -260,9 +300,9 @@ class AdaptivePINNLoss(nn.Module):
         time_max = self.feat_max[time_idx]
         dT_dt_real = dT_dtscaled / (time_max - time_min)
 
-        V_real = self._unscale(x[:, voltage_idx: voltage_idx + 1], self.feat_min[voltage_idx], self.feat_max[voltage_idx])
-        Vocv_real = self._unscale(x[:, ocv_idx: ocv_idx + 1], self.feat_min[ocv_idx], self.feat_max[ocv_idx])
-        I_real = self._unscale(x[:, current_idx: current_idx + 1], self.feat_min[current_idx], self.feat_max[current_idx])
+        V_real = self._unscale(self._extract_col(x, voltage_idx), self.feat_min[voltage_idx], self.feat_max[voltage_idx])
+        Vocv_real = self._unscale(self._extract_col(x, ocv_idx), self.feat_min[ocv_idx], self.feat_max[ocv_idx])
+        I_real = self._unscale(self._extract_col(x, current_idx), self.feat_min[current_idx], self.feat_max[current_idx])
 
         residual = (
             dT_dt_real
