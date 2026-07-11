@@ -22,6 +22,10 @@ Examples:
 5. After review/merge, delete the feature branch.
 6. Periodically (at milestones), the lead opens a PR from `develop` into `main`.
 
+## Milestone results (`results/`)
+
+`outputs/` is gitignored (scratch/ephemeral — regenerate by re-running scripts, never commit raw data or routine checkpoints there). For an actual sprint milestone deliverable (a key trained checkpoint + its proof plot), commit a small curated copy to `results/<milestone-name>/` instead — `.gitignore` has an explicit exception for this directory. Include a short `README.md` in that folder with the headline metrics and the exact command to reproduce it. If the result depends on code that gets changed later (e.g. a bugfix that alters training behavior), tag the commit it was produced on (`git tag <name> <commit>`) so it stays reproducible — see `sprint2-fcn-baseline` for an example.
+
 ## Handoffs
 
 When a task is completed, a `handoffs/handoff_<name>.md` file is generated documenting what was built, how to run it, dependencies, and integration notes. Check `handoffs/` before starting work that depends on a teammate's task.
