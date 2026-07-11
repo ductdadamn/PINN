@@ -7,6 +7,16 @@ Coulomb Counting (discrete form, per spec):
 Sign convention: this dataset follows the Arbin convention where
 Current(A) > 0 is charge and Current(A) < 0 is discharge. The equation
 above is applied to the raw Current(A) column unchanged -- no sign flip.
+
+Sprint 3: BatteryDataset now defaults to sequence-wise sampling
+(sequence_length=SEQUENCE_LENGTH_DEFAULT=50), yielding 3D windows
+(sequence_length, n_features) per item -- a DataLoader batches these into
+(Batch, Seq_Len, Features) for the LSTM (src/models/lstm_shen2025.py). This
+was already supported by the sequence_length>1 code path added in Task 1
+("ready for an LSTM later -- same class, no interface change needed") --
+Sprint 3 just activates it as the default and verifies it end-to-end.
+Sprint 2's FCN scripts (train_fcn.py, evaluate.py) explicitly pass
+sequence_length=1 and are unaffected by this default change.
 """
 import glob
 import os
@@ -28,6 +38,11 @@ DISCHARGE_CAP_COL = "Discharge_Capacity(Ah)"
 
 FEATURE_COLS = [TIME_COL, CURRENT_COL, VOLTAGE_COL, "OCV_Estimated"]
 TARGET_COL = TEMP_COL
+
+# Sprint 3: default sequence length for sequence-wise (LSTM) sampling.
+# FCN scripts (train_fcn.py, evaluate.py) explicitly pass sequence_length=1
+# to stay point-wise -- this default only takes effect where not overridden.
+SEQUENCE_LENGTH_DEFAULT = 50
 
 
 # ---------------------------------------------------------------------------
@@ -215,21 +230,30 @@ class BatteryDataset(Dataset):
     """Battery drive-cycle dataset.
 
     Features: [Time, Current, Voltage, OCV_Estimated] (Min-Max scaled).
-    Target: Temperature.
+    Target: Temperature AT THE LAST TIMESTEP OF THE WINDOW (many-to-one --
+    "given the past sequence_length steps, predict the current step's
+    Temperature").
 
-    sequence_length=1 returns point-wise 2D samples: (n_features,) per item,
-    suitable for the current FCN. sequence_length>1 returns sliding-window 3D
-    samples: (sequence_length, n_features), ready for an LSTM later -- same
-    class, no interface change needed when upgrading.
+    sequence_length=1 (pass explicitly -- e.g. train_fcn.py/evaluate.py do)
+    returns point-wise 2D samples: (n_features,) per item, for the Sprint 2
+    FCN. sequence_length>1 (default SEQUENCE_LENGTH_DEFAULT=50, Sprint 3)
+    returns sliding-window 3D samples: (sequence_length, n_features) per
+    item -- a DataLoader batches these into (Batch, Seq_Len, Features), the
+    shape BatteryPINN_Shen (src/models/lstm_shen2025.py) expects. Same
+    class/code path either way, no separate sequence dataset needed.
 
     __getitem__ returns a 3-tuple (x, y, is_initial_step) -- NOT (x, y). The
-    third element flags whether this sample is the trajectory's initial
-    condition anchor (row 0 of the DST/FUDS segment -- the first sample after
-    the pre-drive-cycle rest, i.e. t_start with SOC=1.0), needed by
+    third element flags whether this sample/window is the trajectory's
+    initial condition anchor: for sequence_length=1, row 0 of the segment;
+    for sequence_length>1, the window STARTING at row 0 (i.e. covering the
+    segment's first sequence_length rows) -- both cases keyed by the same
+    window-start index, so no special-casing is needed. This is t_start
+    (SOC=1.0, right after the pre-drive-cycle rest), needed by
     AdaptivePINNLoss.compute_initial_loss (src/losses.py) per Cho 2022's
     Loss_initial = MSE(T_pred(t_start), T_amb). Each segment has exactly one
-    such row, so with shuffle=True most batches will have is_initial_step
-    all-zero -- that's expected, not a bug.
+    such row/window, so with shuffle=True most batches will have
+    is_initial_step all-zero -- use AnchorInclusiveBatchSampler (below) for
+    training so every batch includes it.
     """
 
     def __init__(
@@ -237,7 +261,7 @@ class BatteryDataset(Dataset):
         df,
         feature_cols=None,
         target_col=TARGET_COL,
-        sequence_length=1,
+        sequence_length=SEQUENCE_LENGTH_DEFAULT,
         feature_scaler=None,
         target_scaler=None,
         fit_scalers=True,
@@ -288,19 +312,27 @@ class BatteryDataset(Dataset):
 
 class AnchorInclusiveBatchSampler(Sampler[List[int]]):
     """BatchSampler that guarantees every yielded batch includes all of
-    `anchor_indices` (for BatteryDataset, always [0] -- the t_start row),
-    alongside a shuffled selection of the remaining indices.
+    `anchor_indices` (for BatteryDataset, always [0] -- the t_start row/
+    window), alongside a shuffled selection of the remaining indices.
+
+    Works unchanged for sequence-wise sampling (BatteryDataset with
+    sequence_length>1, Sprint 3): `anchor_indices=(0,)` still refers to
+    window-start index 0, i.e. the window covering the segment's first
+    sequence_length rows -- BatteryDataset.is_initial_step is indexed by
+    window-start position for both point-wise and windowed sampling (see its
+    docstring), so no changes were needed here to "synchronize" with
+    sequence mode -- the existing index-based design already generalized.
 
     WHY THIS EXISTS: AdaptivePINNLoss's Loss_initial (src/losses.py) is only
     nonzero -- and only has nonzero gradient -- on samples where
     is_initial_step==1. Each BatteryDataset trajectory has exactly ONE such
-    row (index 0). With plain `shuffle=True` and batch_size << dataset size,
-    that row lands in roughly 1-in-(dataset_len/batch_size) batches, so on
-    every other batch mean(|grad Loss_initial|) is EXACTLY zero, which blew
-    up update_weights()'s beta_hat = max(|grad L_data|) / mean(|grad
+    row/window (index 0). With plain `shuffle=True` and batch_size << dataset
+    size, that row lands in roughly 1-in-(dataset_len/batch_size) batches, so
+    on every other batch mean(|grad Loss_initial|) is EXACTLY zero, which
+    blew up update_weights()'s beta_hat = max(|grad L_data|) / mean(|grad
     L_initial|) into the billions within a single trial epoch (confirmed
     empirically -- see handoffs/sprint2_tasks.md). This sampler fixes that at
-    the data-loading level: the anchor row is always present, so that
+    the data-loading level: the anchor row/window is always present, so that
     denominator is never exactly zero.
 
     Parameters
@@ -355,12 +387,16 @@ class AnchorInclusiveBatchSampler(Sampler[List[int]]):
 # Orchestration
 # ---------------------------------------------------------------------------
 
-def build_datasets(raw_dir="data/raw", sequence_length=1, soc0=1.0):
+def build_datasets(raw_dir="data/raw", sequence_length=SEQUENCE_LENGTH_DEFAULT, soc0=1.0):
     """End-to-end pipeline: load raw CSVs -> OCV reference curve -> OCV_Estimated
     -> DST/FUDS split -> BatteryDataset for train (DST) and test (FUDS).
 
     The feature/target scalers are fit on the train set (DST) only and reused
     (transform-only) on the test set (FUDS) to avoid data leakage.
+
+    sequence_length defaults to SEQUENCE_LENGTH_DEFAULT (50, Sprint 3 LSTM
+    use). Pass sequence_length=1 explicitly for the Sprint 2 point-wise FCN
+    (train_fcn.py/evaluate.py already do this via their own CLI default).
     """
     ocv_path, dynamic_path = find_raw_files(raw_dir)
     ocv_df = load_raw_csv(ocv_path)
