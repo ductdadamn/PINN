@@ -93,7 +93,7 @@ class BatteryPINN_Shen(nn.Module):
         self.n_lstm_layers = n_lstm_layers
         self.output_dim = output_dim
 
-        # TODO(Kieu): declare 4 separate single-layer LSTMs, e.g.
+        # TODO AOI(Kieu): declare 4 separate single-layer LSTMs, e.g.
         #   self.lstm1 = nn.LSTM(input_dim, hidden_size, batch_first=True)
         #   self.lstm2 = nn.LSTM(hidden_size, hidden_size, batch_first=True)
         #   self.lstm3 = nn.LSTM(hidden_size, hidden_size, batch_first=True)
@@ -111,9 +111,7 @@ class BatteryPINN_Shen(nn.Module):
         same contract as BatteryPINN_Cho2022.shared_parameters()
         (src/models/fcn_cho2022.py), just a different architecture.
         """
-        raise NotImplementedError(
-            "Kieu: return itertools.chain(self.lstm4.parameters(), self.output_layer.parameters())"
-        )
+        return chain(self.lstm4.parameters(), self.output_layer.parameters())
 
     def forward(self, x: Tensor) -> Tensor:
         """
