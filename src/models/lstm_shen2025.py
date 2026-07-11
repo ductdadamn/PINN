@@ -31,6 +31,7 @@ sequence as input) rather than one nn.LSTM(num_layers=4, ...) -- this makes
 instead of having to filter a combined module's per-layer-named parameters.
 """
 from typing import Iterator
+import itertools  # Cần thiết để sử dụng itertools.chain trong shared_parameters
 
 import torch
 import torch.nn as nn
@@ -100,6 +101,13 @@ class BatteryPINN_Shen(nn.Module):
         #   self.lstm4 = nn.LSTM(hidden_size, hidden_size, batch_first=True)
         # then the output projection:
         #   self.output_layer = nn.Linear(hidden_size, output_dim)
+        
+        self.lstm1 = nn.LSTM(self.input_dim, self.hidden_size, batch_first=True)
+        self.lstm2 = nn.LSTM(self.hidden_size, self.hidden_size, batch_first=True)
+        self.lstm3 = nn.LSTM(self.hidden_size, self.hidden_size, batch_first=True)
+        self.lstm4 = nn.LSTM(self.hidden_size, self.hidden_size, batch_first=True)
+        
+        self.output_layer = nn.Linear(self.hidden_size, self.output_dim)
 
     def shared_parameters(self) -> Iterator[nn.Parameter]:
         """Parameters of the LAST (4th) LSTM layer + output Linear layer
@@ -111,7 +119,7 @@ class BatteryPINN_Shen(nn.Module):
         same contract as BatteryPINN_Cho2022.shared_parameters()
         (src/models/fcn_cho2022.py), just a different architecture.
         """
-        return chain(self.lstm4.parameters(), self.output_layer.parameters())
+        return itertools.chain(self.lstm4.parameters(), self.output_layer.parameters())
 
     def forward(self, x: Tensor) -> Tensor:
         """
@@ -125,10 +133,16 @@ class BatteryPINN_Shen(nn.Module):
         Tensor, shape (Batch, output_dim)
             Predicted temperature at the window's last timestep.
         """
-        raise NotImplementedError(
-            "Kieu: run x through lstm1->lstm2->lstm3->lstm4 sequentially "
-            "(each LSTM's full output sequence feeds the next layer's input), "
-            "take the LAST layer's h_T (either lstm4's returned h_n, or "
-            "lstm4_output[:, -1, :] -- they're equivalent since batch_first=True "
-            "and this is a single-directional LSTM), then self.output_layer(h_T)"
-        )
+        # Kieu: run x through lstm1->lstm2->lstm3->lstm4 sequentially 
+        # (each LSTM's full output sequence feeds the next layer's input), 
+        # take the LAST layer's h_T (either lstm4's returned h_n, or 
+        # lstm4_output[:, -1, :] -- they're equivalent since batch_first=True 
+        # and this is a single-directional LSTM), then self.output_layer(h_T)
+        
+        out_lstm1, _ = self.lstm1(x)          # Shape: (Batch, Seq_Len, hidden_size)
+        out_lstm2, _ = self.lstm2(out_lstm1)   # Shape: (Batch, Seq_Len, hidden_size)
+        out_lstm3, _ = self.lstm3(out_lstm2)   # Shape: (Batch, Seq_Len, hidden_size)
+        out_lstm4, _ = self.lstm4(out_lstm3)   # Shape: (Batch, Seq_Len, hidden_size)
+        h_T = out_lstm4[:, -1, :]              # Shape: (Batch, hidden_size)
+        out = self.output_layer(h_T)           # Shape: (Batch, output_dim)
+        return out
