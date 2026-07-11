@@ -1,36 +1,28 @@
 """
 Training script for the Shen 2025 stacked-LSTM sequence model.
 
-Owner: Cam.
+Owner: Cam. Implemented by the leader while Cam was unavailable -- see
+handoffs/ for the corresponding note.
 
 Goal: train BatteryPINN_Shen on the DST (train) split using sequence-wise
 (sliding-window) data and the hotfixed AdaptivePINNLoss, logging RMSE/MAE/
 alpha/beta per epoch, and checkpoint the trained model for
 scripts/evaluate_lstm.py to consume.
 
-Run (once implemented):
+Run:
     .venv/bin/python scripts/train_lstm.py --epochs 25 --batch-size 32 --lr 1e-4
 
-SKELETON ONLY -- the training loop body is intentionally left unimplemented.
-Do not modify src/losses.py's math, src/data_loader.py's pipeline, or
-src/models/lstm_shen2025.py's architecture while wiring this up; import and
-use them as-is.
-
-IMPORTANT KNOWN GAP (flagged by the leader, not yet resolved): AdaptivePINNLoss.
-compute_physics_loss/compute_initial_loss (src/losses.py) currently index
-their input tensor `x` assuming it's 2D (Batch, Features) -- e.g.
-`x[:, time_idx:time_idx+1]`. For this script's 3D (Batch, Seq_Len, Features)
-sequence input, that indexing is WRONG (it would slice along the sequence
-dimension, not features) and will silently produce incorrect physics/initial
-loss values rather than crashing. Do not attempt to fix src/losses.py
-yourself -- ping the leader to resolve this before trusting physics_loss/
-initial_loss numbers from a real training run. data_loss (the primary
-metric) is unaffected, since compute_data_loss doesn't index into x.
+The 3D-indexing gap in AdaptivePINNLoss.compute_physics_loss that was
+flagged when this file was still a skeleton (it assumed 2D input, silently
+mis-indexing this script's 3D sequence input) has been fixed in
+src/losses.py -- see that module's docstring for details. data_loss was
+never affected; physics_loss/initial_loss are now correct too.
 """
 import argparse
 import os
 import sys
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
@@ -39,6 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.data_loader import AnchorInclusiveBatchSampler, SEQUENCE_LENGTH_DEFAULT, build_datasets  # noqa: E402
 from src.losses import AdaptivePINNLoss  # noqa: E402
 from src.models.lstm_shen2025 import BatteryPINN_Shen  # noqa: E402
+from scripts.evaluate import compute_metrics  # noqa: E402
 
 DEFAULT_CHECKPOINT_PATH = "outputs/checkpoints/lstm_shen2025.pth"
 
@@ -71,11 +64,15 @@ def compute_epoch_metrics(y_true_scaled, y_pred_scaled, target_scaler) -> dict:
     Returns
     -------
     dict
-        {"rmse": float, "mae": float}, in degC. Mirrors
-        scripts/evaluate.py's compute_metrics -- consider importing/reusing
-        that instead of duplicating the sklearn calls, if convenient.
+        {"rmse": float, "mae": float}, in degC. Reuses
+        scripts/evaluate.py's compute_metrics rather than duplicating the
+        sklearn calls.
     """
-    raise NotImplementedError("Cam: inverse-transform both arrays via target_scaler, compute RMSE/MAE")
+    y_true_scaled = np.asarray(y_true_scaled).reshape(-1, 1)
+    y_pred_scaled = np.asarray(y_pred_scaled).reshape(-1, 1)
+    y_true_real = target_scaler.inverse_transform(y_true_scaled).ravel()
+    y_pred_real = target_scaler.inverse_transform(y_pred_scaled).ravel()
+    return compute_metrics(y_true_real, y_pred_real)
 
 
 def train(
@@ -104,17 +101,16 @@ def train(
         internally -- pass the raw batch straight through, do not call
         model(x) yourself. `epoch` (0-indexed) drives the Task 0
         warm-up/clamping hotfix -- MUST be the current epoch number, not a
-        running iteration count. See the module docstring above re: the
-        known 3D-indexing gap in compute_physics_loss/compute_initial_loss.
+        running iteration count.
     optimizer : torch.optim.Optimizer
         Built from `loss_fn.parameters()` (NOT `model.parameters()` +
         `loss_fn.parameters()` -- see src/losses.py's class docstring for
         why that double-counts).
     scheduler : torch.optim.lr_scheduler.LRScheduler
         StepLR(optimizer, step_size=args.lr_step_size, gamma=args.lr_gamma).
-        IMPORTANT: step_size counts ITERATIONS (batches), not epochs -- call
-        scheduler.step() once per batch/iteration inside the inner loop, NOT
-        once per epoch (a common mistake with StepLR).
+        IMPORTANT: step_size counts ITERATIONS (batches), not epochs -- called
+        once per batch/iteration inside the inner loop below, NOT once per
+        epoch (a common mistake with StepLR).
     epochs : int
         Number of training epochs (25 by default, per spec).
     device : str
@@ -124,37 +120,62 @@ def train(
     -------
     BatteryPINN_Shen
         The trained model (same object, mutated in place).
-
-    Expected steps (TODO for Cam)
-    ------------------------------
-    1. model.train()
-    2. for epoch in range(epochs):
-         for each (x, y, is_initial_step) batch:
-           - move x, y, is_initial_step to device
-           - optimizer.zero_grad()
-           - loss, log_dict = loss_fn(x, y, is_initial_step, epoch)
-           - loss.backward()
-           - optimizer.step()
-           - scheduler.step()              # per-ITERATION, see above
-           - accumulate y (unscaled-space y_true) and the model's y_pred
-             (re-run or capture from inside loss_fn.forward if you refactor
-             to expose it -- currently loss_fn.forward doesn't return
-             y_pred directly, only total_loss/log_dict; simplest is an
-             extra no_grad() forward pass for metrics, or track loss_fn's
-             internal T_pred_scaled if you extend the return value -- your
-             call, just don't touch src/losses.py's math while doing it)
-         after the epoch: compute_epoch_metrics(...) for RMSE/MAE, and pull
-         alpha/beta from the last batch's log_dict (same pattern as
-         scripts/train_fcn.py), print/log all four numbers for this epoch
-    3. return model
     """
-    raise NotImplementedError("Cam: implement the training loop")
+    model.train()
+
+    for epoch in range(epochs):
+        epoch_loss = 0.0
+        n_batches = 0
+        last_log_dict = {}
+        y_true_epoch = []
+        y_pred_epoch = []
+
+        for x, y, is_initial_step in train_loader:
+            x = x.to(device)
+            y = y.to(device)
+            is_initial_step = is_initial_step.to(device)
+
+            optimizer.zero_grad()
+            loss, log_dict = loss_fn(x, y, is_initial_step, epoch)
+            loss.backward()
+            optimizer.step()
+            scheduler.step()  # per-ITERATION, not per-epoch -- see docstring above
+
+            epoch_loss += loss.item()
+            n_batches += 1
+            last_log_dict = log_dict
+
+            # loss_fn.forward() only returns total_loss/log_dict, not y_pred
+            # directly -- a separate no_grad() forward pass for per-epoch
+            # metrics is the simplest way to get it without touching
+            # src/losses.py's return signature.
+            with torch.no_grad():
+                y_pred = model(x)
+            y_true_epoch.append(y.detach().cpu().numpy())
+            y_pred_epoch.append(y_pred.detach().cpu().numpy())
+
+        avg_loss = epoch_loss / n_batches
+        y_true_epoch = np.concatenate(y_true_epoch, axis=0)
+        y_pred_epoch = np.concatenate(y_pred_epoch, axis=0)
+        metrics = compute_epoch_metrics(y_true_epoch, y_pred_epoch, train_loader.dataset.target_scaler)
+
+        alpha = last_log_dict.get("alpha", "N/A")
+        beta = last_log_dict.get("beta", "N/A")
+        print(
+            f"Epoch {epoch + 1}/{epochs} - Loss: {avg_loss:.6f}, "
+            f"RMSE: {metrics['rmse']:.4f}, MAE: {metrics['mae']:.4f}, "
+            f"Alpha: {alpha}, Beta: {beta}"
+        )
+
+    return model
 
 
 def save_checkpoint(model: BatteryPINN_Shen, path: str) -> None:
     """Save model state_dict to `path`, creating parent dirs as needed.
     Same pattern as scripts/train_fcn.py's save_checkpoint."""
-    raise NotImplementedError("Cam: implement checkpoint saving (torch.save(model.state_dict(), path))")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    torch.save(model.state_dict(), path)
+    print(f"Checkpoint saved to {path}")
 
 
 def main() -> None:
