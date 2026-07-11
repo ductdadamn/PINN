@@ -9,12 +9,11 @@ and generate the "pitching proof" overlay figure comparing the Sprint 2 FCN
 baseline (flat/failed) against the Sprint 3 LSTM (predicted) alongside the
 true dynamic load profile.
 
-Run (once implemented):
+Run:
     .venv/bin/python scripts/evaluate_lstm.py \\
+        --raw-dir PINN_dataset \\
         --fcn-checkpoint-path outputs/checkpoints/fcn_cho2022.pth \\
         --lstm-checkpoint-path outputs/checkpoints/lstm_shen2025.pth
-
-SKELETON ONLY -- inference/plotting logic intentionally left unimplemented.
 
 REUSE OPPORTUNITY: scripts/evaluate.py (your own Sprint 2 file) already has
 load_model (FCN-specific), run_inference (model-agnostic -- works for the
@@ -49,16 +48,18 @@ import os
 import sys
 
 import matplotlib.pyplot as plt
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.data_loader import SEQUENCE_LENGTH_DEFAULT, build_datasets  # noqa: E402
+from src.data_loader import CURRENT_COL, SEQUENCE_LENGTH_DEFAULT, TIME_COL, VOLTAGE_COL, build_datasets  # noqa: E402
 from src.models.fcn_cho2022 import BatteryPINN_Cho2022  # noqa: E402
 from src.models.lstm_shen2025 import BatteryPINN_Shen  # noqa: E402
 from scripts.evaluate import compute_metrics, load_model as load_fcn_model, run_inference  # noqa: E402
 
+DEFAULT_RAW_DIR = "data/raw"
 DEFAULT_FCN_CHECKPOINT_PATH = "outputs/checkpoints/fcn_cho2022.pth"
 DEFAULT_LSTM_CHECKPOINT_PATH = "outputs/checkpoints/lstm_shen2025.pth"
 DEFAULT_PLOT_PATH = "outputs/figures/pitching_proof.png"
@@ -67,6 +68,7 @@ ACADEMIC_TARGET_RMSE_C = 0.6
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate the Shen 2025 LSTM on FUDS and generate the pitching proof plot")
+    parser.add_argument("--raw-dir", type=str, default=DEFAULT_RAW_DIR)
     parser.add_argument("--fcn-checkpoint-path", type=str, default=DEFAULT_FCN_CHECKPOINT_PATH)
     parser.add_argument("--lstm-checkpoint-path", type=str, default=DEFAULT_LSTM_CHECKPOINT_PATH)
     parser.add_argument("--plot-path", type=str, default=DEFAULT_PLOT_PATH)
@@ -85,7 +87,12 @@ def load_lstm_model(checkpoint_path: str, device: str) -> BatteryPINN_Shen:
     BatteryPINN_Shen
         Model in eval() mode, on `device`.
     """
-    raise NotImplementedError("Kem: implement checkpoint loading (torch.load + load_state_dict), same pattern as scripts/evaluate.py's load_model")
+    model = BatteryPINN_Shen()
+    state_dict = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    model.load_state_dict(state_dict)
+    model.to(device)
+    model.eval()
+    return model
 
 
 def generate_pitching_plot(
@@ -131,11 +138,35 @@ def generate_pitching_plot(
     save_path : str
         Where to save the figure (creates parent dirs as needed).
     """
-    raise NotImplementedError(
-        "Kem: slice df_fuds/true_temp_real/fcn_pred_real to [sequence_length-1:], "
-        "then plt.subplots(3, 1, sharex=True, figsize=...) with Current, "
-        "Voltage+OCV_Estimated, and Temperature (3 lines: true/FCN/LSTM) subplots"
-    )
+    df_aligned = df_fuds.iloc[sequence_length - 1:]
+    true_temp_aligned = np.asarray(true_temp_real)[sequence_length - 1:]
+    fcn_pred_aligned = np.asarray(fcn_pred_real)[sequence_length - 1:]
+    time = df_aligned[TIME_COL].to_numpy()
+
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+    fig, axes = plt.subplots(3, 1, sharex=True, figsize=(14, 10))
+
+    axes[0].plot(time, df_aligned[CURRENT_COL], color="tab:green", linewidth=0.8)
+    axes[0].set_ylabel("Current (A)")
+    axes[0].set_title("True Dynamic Current Profile (FUDS)")
+
+    axes[1].plot(time, df_aligned[VOLTAGE_COL], label="Voltage (measured)", color="tab:blue", linewidth=1)
+    axes[1].plot(time, df_aligned["OCV_Estimated"], label="OCV_Estimated", color="tab:orange", linewidth=1)
+    axes[1].set_ylabel("Voltage (V)")
+    axes[1].legend()
+
+    axes[2].plot(time, true_temp_aligned, label="True Measured", color="tab:blue", linewidth=1)
+    axes[2].plot(time, fcn_pred_aligned, label="FCN Baseline (Sprint 2)", color="tab:red", linestyle="--", linewidth=1)
+    axes[2].plot(time, lstm_pred_real, label="Shen LSTM (Sprint 3)", color="tab:green", linewidth=1)
+    axes[2].set_ylabel("Temperature (degC)")
+    axes[2].set_xlabel("Time (s)")
+    axes[2].legend()
+
+    fig.suptitle("Pitching Proof: FCN Baseline vs Shen LSTM on FUDS")
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=150)
+    plt.close(fig)
 
 
 def main() -> None:
@@ -147,9 +178,9 @@ def main() -> None:
     # scalers are numerically equivalent -- no correctness issue, just two
     # redundant (cheap) passes over the raw CSVs, acceptable for an
     # evaluation script that runs once.
-    _train_fcn, test_dataset_fcn, meta = build_datasets(raw_dir="data/raw", sequence_length=1)
+    _train_fcn, test_dataset_fcn, meta = build_datasets(raw_dir=args.raw_dir, sequence_length=1)
     _train_lstm, test_dataset_lstm, _meta_lstm = build_datasets(
-        raw_dir="data/raw", sequence_length=args.sequence_length
+        raw_dir=args.raw_dir, sequence_length=args.sequence_length
     )
 
     fcn_loader = DataLoader(test_dataset_fcn, batch_size=args.batch_size, shuffle=False)
