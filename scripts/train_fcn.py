@@ -63,10 +63,13 @@ def train(
         (see AnchorInclusiveBatchSampler's docstring for why).
     loss_fn : AdaptivePINNLoss
         Combines data + physics (PDE) + initial-condition loss. IMPORTANT:
-        loss_fn.forward(x, y, is_initial_step) runs `model(x)` internally
-        (needed so it can autograd dT/dt w.r.t. the raw input) -- do NOT
-        call model(x) yourself and pass y_pred in; pass the raw batch
-        straight through. See src/losses.py's forward() docstring.
+        loss_fn.forward(x, y, is_initial_step, epoch) runs `model(x)`
+        internally (needed so it can autograd dT/dt w.r.t. the raw input) --
+        do NOT call model(x) yourself and pass y_pred in; pass the raw batch
+        straight through. `epoch` (NEW, Sprint 3 Task 0 hotfix) drives the
+        alpha/beta warm-up (hardcoded for epoch < 5) and post-warm-up
+        clamping to [1e-3, 1e3] -- see src/losses.py's forward()/
+        update_weights() docstrings.
     optimizer : torch.optim.Optimizer
         Built from `loss_fn.parameters()` (NOT `model.parameters()` +
         `loss_fn.parameters()` -- since `model` is a registered submodule of
@@ -98,9 +101,9 @@ def train(
             is_initial_step = is_initial_step.to(device)
             
             optimizer.zero_grad()
-            
-            loss, log_dict = loss_fn(x, y, is_initial_step)
-            
+
+            loss, log_dict = loss_fn(x, y, is_initial_step, epoch)
+
             loss.backward()
             optimizer.step()
             

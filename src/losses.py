@@ -53,6 +53,26 @@ meaning is "the initial condition where no current flows and battery
 temperature equals ambient temperature," i.e. a constraint on predicted
 TEMPERATURE, not on f. See compute_initial_loss below.
 
+STABILIZATION HOTFIX (Sprint 3 Task 0), per Strategic Commander instruction,
+in response to the Sprint 2 finding that the FCN baseline collapsed to a
+degenerate constant-T_amb prediction (alpha reached ~1e10, beta ~1e5,
+drowning out the unweighted Loss_data term). Does NOT alter the underlying
+Cho 2022 moving-average math (gamma=0.9, the alpha_hat/beta_hat formulas
+above) -- adds two guardrails around it instead:
+  1. Weight warm-up: for epoch in [0, warmup_epochs) (default 5, i.e.
+     epochs 0-4), alpha/beta are hardcoded to 0.0/1.0 and the adaptive
+     update is skipped entirely -- Loss_total reduces to just Loss_data
+     (+ Loss_initial, unweighted) during warm-up, so the network learns the
+     real data-fitting trajectory before physics/initial terms are allowed
+     to compete with it.
+  2. Weight clamping: from epoch >= warmup_epochs onward, the normal EMA
+     update runs as before, but the result is clamped to [1e-3, 1e3] before
+     being stored/returned, bounding how far a single noisy gradient-ratio
+     estimate can swing alpha/beta.
+Both forward() and update_weights() now take an `epoch: int` argument to
+implement this -- a required, breaking change to the Sprint 2 call
+signature. See their docstrings below.
+
 This module is now fully implemented.
 """
 from typing import Dict, Iterable, Tuple
@@ -92,6 +112,18 @@ class AdaptivePINNLoss(nn.Module):
         Moving-average update weight (per Cho 2022; note this is the weight
         on the NEW estimate, not the old one -- gamma=0.9 means each update
         is 90% the fresh gradient-ratio estimate, 10% the previous value).
+    warmup_epochs : int
+        Number of initial epochs (0-indexed, [0, warmup_epochs)) during
+        which alpha/beta are hardcoded rather than adaptively updated --
+        see `warmup_alpha`/`warmup_beta`. Default 5 (epochs 0-4), per the
+        Sprint 3 Task 0 stabilization hotfix.
+    warmup_alpha, warmup_beta : float
+        Hardcoded alpha/beta values used during warm-up. Defaults 0.0/1.0 --
+        i.e. Loss_PDE is excluded entirely and Loss_initial is included
+        unweighted while the network first learns Loss_data.
+    alpha_clamp, beta_clamp : Tuple[float, float]
+        (min, max) bounds applied to alpha/beta after each adaptive update,
+        once warm-up has ended. Default (1e-3, 1e3) for both, per Task 0.
     ambient_temp_c : float
         Chamber/ambient temperature T_amb in the Lumped Capacitance Model,
         in degrees C. Default 25.0 -- inferred from the "-25-" in the raw
@@ -124,6 +156,11 @@ class AdaptivePINNLoss(nn.Module):
         alpha_init: float = 1.0,
         beta_init: float = 1.0,
         gamma: float = 0.9,
+        warmup_epochs: int = 5,
+        warmup_alpha: float = 0.0,
+        warmup_beta: float = 1.0,
+        alpha_clamp: Tuple[float, float] = (1e-3, 1e3),
+        beta_clamp: Tuple[float, float] = (1e-3, 1e3),
         ambient_temp_c: float = 25.0,
     ) -> None:
         super().__init__()
@@ -131,6 +168,11 @@ class AdaptivePINNLoss(nn.Module):
         self.alpha_init = alpha_init
         self.beta_init = beta_init
         self.gamma = gamma
+        self.warmup_epochs = warmup_epochs
+        self.warmup_alpha = warmup_alpha
+        self.warmup_beta = warmup_beta
+        self.alpha_clamp = alpha_clamp
+        self.beta_clamp = beta_clamp
         self.alpha: float = alpha_init
         self.beta: float = beta_init
         self.ambient_temp_c = ambient_temp_c
@@ -316,14 +358,23 @@ class AdaptivePINNLoss(nn.Module):
         return nn.functional.mse_loss(T_initial_pred, T_amb_target)
 
     def update_weights(
-        self, data_loss: Tensor, physics_loss: Tensor, initial_loss: Tensor
+        self, data_loss: Tensor, physics_loss: Tensor, initial_loss: Tensor, epoch: int
     ) -> Tuple[float, float]:
-        """Cho 2022 Adaptive Normalization update for self.alpha / self.beta.
+        """Cho 2022 Adaptive Normalization update for self.alpha / self.beta,
+        with the Sprint 3 Task 0 stabilization hotfix (warm-up + clamping)
+        wrapped around the unmodified underlying math.
 
+        If epoch < self.warmup_epochs:
+            alpha, beta = self.warmup_alpha, self.warmup_beta  (hardcoded;
+            no gradient computation, no adaptive update at all this step)
+
+        Else (epoch >= self.warmup_epochs), the original Cho 2022 update:
             alpha_hat = max(|grad Loss_data|) / mean(|grad Loss_PDE|)
             beta_hat  = max(|grad Loss_data|) / mean(|grad Loss_initial|)
             alpha = (1 - gamma) * alpha_prev + gamma * alpha_hat
             beta  = (1 - gamma) * beta_prev  + gamma * beta_hat
+        followed by clamping alpha to self.alpha_clamp and beta to
+        self.beta_clamp (default [1e-3, 1e3] each).
 
         Gradients computed w.r.t. self.model.shared_parameters() only (the
         shared 4x145 FC + output stack, not the input-specific pre-layer
@@ -334,12 +385,20 @@ class AdaptivePINNLoss(nn.Module):
         data_loss, physics_loss, initial_loss : Tensor, scalar
             Current-step losses from compute_data_loss / compute_physics_loss
             / compute_initial_loss.
+        epoch : int
+            Current 0-indexed training epoch (caller's responsibility to
+            track and pass through -- see scripts/train_fcn.py's loop).
 
         Returns
         -------
         Tuple[float, float]
             Updated (alpha, beta), also stored on self.
         """
+        if epoch < self.warmup_epochs:
+            self.alpha = self.warmup_alpha
+            self.beta = self.warmup_beta
+            return self.alpha, self.beta
+
         shared_params = list(self.model.shared_parameters())
         eps = 1e-12  # numerical-stability guard against zero-gradient denominators; does not alter the formula in the normal case
 
@@ -350,13 +409,16 @@ class AdaptivePINNLoss(nn.Module):
         alpha_hat = (max_grad_data / (mean_grad_pde + eps)).item()
         beta_hat = (max_grad_data / (mean_grad_initial + eps)).item()
 
-        self.alpha = (1 - self.gamma) * self.alpha + self.gamma * alpha_hat
-        self.beta = (1 - self.gamma) * self.beta + self.gamma * beta_hat
+        alpha = (1 - self.gamma) * self.alpha + self.gamma * alpha_hat
+        beta = (1 - self.gamma) * self.beta + self.gamma * beta_hat
+
+        self.alpha = min(max(alpha, self.alpha_clamp[0]), self.alpha_clamp[1])
+        self.beta = min(max(beta, self.beta_clamp[0]), self.beta_clamp[1])
 
         return self.alpha, self.beta
 
     def forward(
-        self, x: Tensor, y_true: Tensor, is_initial_step: Tensor
+        self, x: Tensor, y_true: Tensor, is_initial_step: Tensor, epoch: int
     ) -> Tuple[Tensor, Dict[str, float]]:
         """Compute the total adaptively-weighted loss for one training step.
 
@@ -377,6 +439,11 @@ class AdaptivePINNLoss(nn.Module):
         is_initial_step : Tensor, shape (batch,)
             Third element yielded by BatteryDataset/DataLoader -- see
             compute_initial_loss.
+        epoch : int
+            Current 0-indexed training epoch. NEW in the Sprint 3 Task 0
+            stabilization hotfix -- required so update_weights() can apply
+            the warm-up/clamping guardrails. Caller (the training loop) must
+            track and pass this through every step.
 
         Returns
         -------
@@ -392,7 +459,7 @@ class AdaptivePINNLoss(nn.Module):
         physics_loss = self.compute_physics_loss(x, T_pred_scaled)
         initial_loss = self.compute_initial_loss(x, y_true, T_pred_scaled, is_initial_step)
 
-        alpha, beta = self.update_weights(data_loss, physics_loss, initial_loss)
+        alpha, beta = self.update_weights(data_loss, physics_loss, initial_loss, epoch)
         total_loss = data_loss + alpha * physics_loss + beta * initial_loss
 
         log_dict = {
