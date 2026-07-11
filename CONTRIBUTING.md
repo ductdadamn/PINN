@@ -30,3 +30,5 @@ When a task is completed, a `handoffs/handoff_<name>.md` file is generated docum
 
 - Do not alter core mathematical equations or loss functions without explicit instruction from the Strategic Planner / lead.
 - Keep `data/`, `outputs/`, and `.venv/` out of git (see `.gitignore`) — never commit raw data or model artifacts.
+- Branch names must follow `feature/<name>/<task-slug>` (see examples above) — no unrelated text, no inappropriate language.
+- **No solo resolution of shared-logic merge conflicts in the GitHub web UI.** If a conflict touches `src/losses.py`, `src/data_loader.py`, or a model's `shared_parameters()`/`forward()` contract, ping the lead before resolving it — a wrong pick between "current" and "incoming" is easy to make and easy to miss, and has broken `develop` for everyone at least once already (see `handoffs/sprint2_final_report.md`, §"Repo hygiene notes"). Trivial conflicts (e.g. a docstring wording difference) are fine to resolve solo.
